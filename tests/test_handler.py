@@ -1,4 +1,5 @@
 import importlib
+import json
 
 import pytest
 
@@ -619,3 +620,463 @@ class TestMissingSecretValue:
 
         with pytest.raises(handler.ClientError):
             handler.github_token()
+
+
+class TestContinuation:
+    """The self-invoking loop: the riskiest path, and the one that bills."""
+
+    def repos(self, count):
+        return [
+            {"full_name": f"octocat/r{n}", "clone_url": f"https://x/{n}.git", "size_kb": 1}
+            for n in range(count)
+        ]
+
+    def run(self, monkeypatch, pending, remaining_ms, continuation=0, invoke=None):
+        calls = []
+        monkeypatch.setattr(handler, "github_token", lambda: "ghp_token")
+        monkeypatch.setattr(handler, "configure_git", lambda token: None)
+        monkeypatch.setattr(handler, "_publish_metrics", lambda counts: None)
+        monkeypatch.setattr(handler, "mirror_repository", lambda repo: "mirrored")
+        monkeypatch.setattr(
+            handler.lambda_client,
+            "invoke",
+            invoke or (lambda **kw: calls.append(kw)),
+        )
+        context = FakeContext(remaining_ms)
+        context.invoked_function_arn = "arn:aws:lambda:eu-west-1:1:function:mirror"
+        event = {"pending": pending, "continuation": continuation}
+        return context, calls, event
+
+    def test_always_completes_one_repository_before_deferring(self, monkeypatch):
+        """The property README claims: a run cannot loop without progressing."""
+        mirrored = []
+        context, calls, event = self.run(monkeypatch, self.repos(3), remaining_ms=0)
+        monkeypatch.setattr(
+            handler,
+            "mirror_repository",
+            lambda repo: (mirrored.append(repo["full_name"]), "mirrored")[1],
+        )
+
+        summary = handler.lambda_handler(event, context)
+
+        # Out of time from the very first check, yet one repository is done.
+        assert mirrored == ["octocat/r0"]
+        assert summary["mirrored"] == 1
+        assert summary["remaining"] == 2
+
+    def test_forwards_exactly_the_repositories_not_reached(self, monkeypatch):
+        context, calls, event = self.run(monkeypatch, self.repos(3), remaining_ms=0)
+
+        handler.lambda_handler(event, context)
+
+        payload = json.loads(calls[0]["Payload"])
+        assert [repo["full_name"] for repo in payload["pending"]] == [
+            "octocat/r1",
+            "octocat/r2",
+        ]
+
+    def test_increments_the_continuation_counter(self, monkeypatch):
+        context, calls, event = self.run(
+            monkeypatch, self.repos(2), remaining_ms=0, continuation=3
+        )
+
+        handler.lambda_handler(event, context)
+
+        assert json.loads(calls[0]["Payload"])["continuation"] == 4
+        assert calls[0]["InvocationType"] == "Event"
+
+    def test_stops_invoking_at_the_continuation_cap(self, monkeypatch):
+        monkeypatch.setattr(handler, "MAX_CONTINUATIONS", 3)
+        context, calls, event = self.run(
+            monkeypatch, self.repos(2), remaining_ms=0, continuation=3
+        )
+
+        with pytest.raises(RuntimeError, match="could not be handed to a continuation"):
+            handler.lambda_handler(event, context)
+
+        assert calls == []
+
+    def test_repositories_dropped_at_the_cap_are_reported_not_silent(self, monkeypatch):
+        monkeypatch.setattr(handler, "MAX_CONTINUATIONS", 1)
+        alerts = []
+        monkeypatch.setattr(
+            handler, "_email_failure", lambda error, report, ctx: alerts.append(report)
+        )
+        context, calls, event = self.run(
+            monkeypatch, self.repos(4), remaining_ms=0, continuation=1
+        )
+
+        with pytest.raises(RuntimeError):
+            handler.lambda_handler(event, context)
+
+        assert alerts[0]["counts"]["deferred"] == 3
+
+    def test_an_oversized_payload_is_reported_rather_than_raised_raw(self, monkeypatch):
+        monkeypatch.setattr(handler, "MAX_ASYNC_PAYLOAD_BYTES", 200)
+        context, calls, event = self.run(monkeypatch, self.repos(50), remaining_ms=0)
+
+        with pytest.raises(RuntimeError, match="could not be handed to a continuation"):
+            handler.lambda_handler(event, context)
+
+        assert calls == []
+
+    def test_a_failed_invoke_is_reported_rather_than_lost(self, monkeypatch):
+        def exploding(**_):
+            raise handler.ClientError(
+                {"Error": {"Code": "TooManyRequestsException", "Message": "no"}}, "Invoke"
+            )
+
+        context, _, event = self.run(
+            monkeypatch, self.repos(3), remaining_ms=0, invoke=exploding
+        )
+
+        with pytest.raises(RuntimeError, match="could not be handed to a continuation"):
+            handler.lambda_handler(event, context)
+
+    def test_a_full_run_does_not_invoke_a_continuation(self, monkeypatch):
+        context, calls, event = self.run(monkeypatch, self.repos(3), remaining_ms=900_000)
+
+        summary = handler.lambda_handler(event, context)
+
+        assert calls == []
+        assert summary["mirrored"] == 3 and summary["deferred"] == 0
+
+
+class TestMetricsCannotCostWork:
+    """Telemetry must never be able to lose the handover of unfinished work."""
+
+    def run(self, monkeypatch, put_metric_data):
+        calls = []
+        monkeypatch.setattr(handler, "github_token", lambda: "ghp_token")
+        monkeypatch.setattr(handler, "configure_git", lambda token: None)
+        monkeypatch.setattr(handler, "mirror_repository", lambda repo: "mirrored")
+        monkeypatch.setattr(handler.lambda_client, "invoke", lambda **kw: calls.append(kw))
+        monkeypatch.setattr(handler.cloudwatch, "put_metric_data", put_metric_data)
+
+        context = FakeContext(0)
+        context.invoked_function_arn = "arn:aws:lambda:eu-west-1:1:function:mirror"
+        pending = [
+            {"full_name": f"octocat/r{n}", "clone_url": "x", "size_kb": 1} for n in range(2)
+        ]
+        return context, calls, {"pending": pending}
+
+    def test_a_botocore_failure_publishing_metrics_is_swallowed(self, monkeypatch):
+        def broken(**_):
+            raise handler.BotoCoreError()
+
+        context, calls, event = self.run(monkeypatch, broken)
+
+        summary = handler.lambda_handler(event, context)
+
+        assert len(calls) == 1
+        assert summary["deferred"] == 0
+
+    def test_an_unexpected_metrics_error_cannot_cost_the_handover(self, monkeypatch):
+        """Proves the ordering, not the except clause.
+
+        An error _publish_metrics does not catch still propagates, so the only
+        thing keeping the unfinished repositories alive is that the handover
+        already happened by then.
+        """
+
+        def broken(**_):
+            raise RuntimeError("something no one anticipated")
+
+        context, calls, event = self.run(monkeypatch, broken)
+
+        with pytest.raises(RuntimeError, match="no one anticipated"):
+            handler.lambda_handler(event, context)
+
+        assert len(calls) == 1, "the continuation must be invoked before metrics"
+
+
+class TestEnsureCodeCommitRepository:
+    class FakeCodeCommit:
+        def __init__(self, exists=False, create_error=None):
+            self.exists = exists
+            self.create_error = create_error
+            self.created = []
+
+        def get_repository(self, repositoryName):
+            if self.exists:
+                return {"repositoryMetadata": {"repositoryName": repositoryName}}
+            raise handler.ClientError(
+                {"Error": {"Code": "RepositoryDoesNotExistException", "Message": "no"}},
+                "GetRepository",
+            )
+
+        def create_repository(self, **kwargs):
+            if self.create_error:
+                raise self.create_error
+            self.created.append(kwargs)
+
+    def test_creates_a_repository_that_does_not_exist(self, monkeypatch):
+        fake = self.FakeCodeCommit(exists=False)
+        monkeypatch.setattr(handler, "codecommit", fake)
+
+        handler.ensure_codecommit_repository("gh-o-r", "A thing", "o/r")
+
+        assert fake.created[0]["repositoryName"] == "gh-o-r"
+        assert fake.created[0]["tags"]["SourceRepository"] == "o/r"
+        assert "Mirror of o/r" in fake.created[0]["repositoryDescription"]
+
+    def test_does_not_recreate_an_existing_repository(self, monkeypatch):
+        fake = self.FakeCodeCommit(exists=True)
+        monkeypatch.setattr(handler, "codecommit", fake)
+
+        handler.ensure_codecommit_repository("gh-o-r", "", "o/r")
+
+        assert fake.created == []
+
+    def test_a_concurrent_run_winning_the_race_is_not_an_error(self, monkeypatch):
+        race = handler.ClientError(
+            {"Error": {"Code": "RepositoryNameExistsException", "Message": "exists"}},
+            "CreateRepository",
+        )
+        monkeypatch.setattr(
+            handler, "codecommit", self.FakeCodeCommit(exists=False, create_error=race)
+        )
+
+        handler.ensure_codecommit_repository("gh-o-r", "", "o/r")
+
+    def test_a_real_create_failure_propagates(self, monkeypatch):
+        denied = handler.ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "CreateRepository",
+        )
+        monkeypatch.setattr(
+            handler, "codecommit", self.FakeCodeCommit(exists=False, create_error=denied)
+        )
+
+        with pytest.raises(handler.ClientError):
+            handler.ensure_codecommit_repository("gh-o-r", "", "o/r")
+
+    def test_a_description_longer_than_codecommit_allows_is_truncated(self, monkeypatch):
+        fake = self.FakeCodeCommit(exists=False)
+        monkeypatch.setattr(handler, "codecommit", fake)
+
+        handler.ensure_codecommit_repository("gh-o-r", "x" * 2000, "o/r")
+
+        assert len(fake.created[0]["repositoryDescription"]) <= 1000
+
+
+class TestMirrorRepository:
+    """Runs real git against real repositories on disk."""
+
+    def source_repo(self, tmp_path, empty=False):
+        import subprocess
+
+        source = tmp_path / "source"
+        source.mkdir()
+        run = lambda *args: subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True
+        )
+        run("init", "--quiet", "--initial-branch=main")
+        run("config", "user.email", "test@example.com")
+        run("config", "user.name", "test")
+        if not empty:
+            (source / "file.txt").write_text("hello\n")
+            run("add", "file.txt")
+            run("commit", "--quiet", "-m", "initial")
+            run("tag", "v1.0.0")
+        return source
+
+    def setup(self, monkeypatch, tmp_path, source, size_kb=1):
+        monkeypatch.setattr(handler, "WORK_DIR", str(tmp_path / "work"))
+        monkeypatch.setattr(
+            handler, "ensure_codecommit_repository", lambda *a, **k: None
+        )
+        return {
+            "full_name": "octocat/thing",
+            "clone_url": str(source),
+            "description": "",
+            "size_kb": size_kb,
+        }
+
+    def intercept_push(self, monkeypatch):
+        """Let every git command run for real except the push to CodeCommit."""
+        pushes = []
+        real_git = handler.git
+
+        def fake_git(args, cwd=None, timeout=900, stdin=None):
+            if args and args[0] == "push":
+                pushes.append((args, cwd))
+                return ""
+            return real_git(args, cwd=cwd, timeout=timeout, stdin=stdin)
+
+        monkeypatch.setattr(handler, "git", fake_git)
+        return pushes
+
+    def test_clones_and_pushes_to_the_codecommit_remote(self, monkeypatch, tmp_path):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path))
+        pushes = self.intercept_push(monkeypatch)
+
+        assert handler.mirror_repository(repo) == "mirrored"
+
+        args, _ = pushes[0]
+        assert "--mirror" in args
+        assert args[-1] == f"codecommit::{handler.CODECOMMIT_REGION}://gh-octocat-thing"
+
+    def test_removes_the_working_copy_afterwards(self, monkeypatch, tmp_path):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path))
+        self.intercept_push(monkeypatch)
+
+        handler.mirror_repository(repo)
+
+        assert not (tmp_path / "work" / "gh-octocat-thing.git").exists()
+
+    def test_removes_the_working_copy_even_when_the_push_fails(
+        self, monkeypatch, tmp_path
+    ):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path))
+        real_git = handler.git
+
+        def fake_git(args, cwd=None, timeout=900, stdin=None):
+            if args and args[0] == "push":
+                raise handler.MirrorError("push rejected")
+            return real_git(args, cwd=cwd, timeout=timeout, stdin=stdin)
+
+        monkeypatch.setattr(handler, "git", fake_git)
+
+        with pytest.raises(handler.MirrorError):
+            handler.mirror_repository(repo)
+
+        assert not (tmp_path / "work" / "gh-octocat-thing.git").exists()
+
+    def test_an_empty_repository_is_created_but_never_pushed(self, monkeypatch, tmp_path):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path, empty=True))
+        pushes = self.intercept_push(monkeypatch)
+
+        assert handler.mirror_repository(repo) == "empty"
+        assert pushes == []
+
+    def test_skips_a_repository_over_the_size_limit_without_cloning(
+        self, monkeypatch, tmp_path
+    ):
+        repo = self.setup(
+            monkeypatch, tmp_path, self.source_repo(tmp_path), size_kb=5 * 1024 * 1024
+        )
+        monkeypatch.setattr(handler, "MAX_REPO_SIZE_MB", 10)
+        monkeypatch.setattr(
+            handler, "git", lambda *a, **k: pytest.fail("should not run git")
+        )
+        monkeypatch.setattr(
+            handler,
+            "ensure_codecommit_repository",
+            lambda *a, **k: pytest.fail("should not touch CodeCommit"),
+        )
+
+        assert handler.mirror_repository(repo) == "skipped"
+
+    def test_a_stale_working_copy_does_not_break_the_next_run(
+        self, monkeypatch, tmp_path
+    ):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path))
+        stale = tmp_path / "work" / "gh-octocat-thing.git"
+        stale.mkdir(parents=True)
+        (stale / "junk").write_text("left over from a killed run")
+        self.intercept_push(monkeypatch)
+
+        assert handler.mirror_repository(repo) == "mirrored"
+
+
+class TestGitHubRetries:
+    """The retry loop itself, not just the delay arithmetic."""
+
+    def response(self, payload):
+        import io
+        import json as _json
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Link": ""}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return FakeResponse(_json.dumps(payload).encode())
+
+    def error(self, code, headers=None):
+        import urllib.error
+
+        return urllib.error.HTTPError(
+            "https://api.github.com/user", code, "", headers or {}, None
+        )
+
+    def test_retries_a_rate_limited_request_and_succeeds(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr(handler.time, "sleep", slept.append)
+        attempts = []
+
+        def urlopen(request, timeout=30):
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise self.error(403, {"Retry-After": "1"})
+            return self.response({"login": "octocat"})
+
+        monkeypatch.setattr(handler.urllib.request, "urlopen", urlopen)
+
+        payload, _ = handler.github_get("https://api.github.com/user", "ghp_token")
+
+        assert payload == {"login": "octocat"}
+        assert len(attempts) == 2 and slept == [1]
+
+    def test_retries_a_server_error(self, monkeypatch):
+        monkeypatch.setattr(handler.time, "sleep", lambda seconds: None)
+        attempts = []
+
+        def urlopen(request, timeout=30):
+            attempts.append(request)
+            if len(attempts) < 3:
+                raise self.error(502)
+            return self.response({"ok": True})
+
+        monkeypatch.setattr(handler.urllib.request, "urlopen", urlopen)
+
+        handler.github_get("https://api.github.com/user", "ghp_token")
+
+        assert len(attempts) == 3
+
+    def test_gives_up_after_the_last_attempt(self, monkeypatch):
+        import urllib.error
+
+        monkeypatch.setattr(handler.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(
+            handler.urllib.request,
+            "urlopen",
+            lambda request, timeout=30: (_ for _ in ()).throw(self.error(500)),
+        )
+
+        with pytest.raises(urllib.error.HTTPError):
+            handler.github_get("https://api.github.com/user", "ghp_token", attempts=3)
+
+    def test_does_not_retry_a_bad_token(self, monkeypatch):
+        import urllib.error
+
+        attempts = []
+
+        def urlopen(request, timeout=30):
+            attempts.append(request)
+            raise self.error(401)
+
+        monkeypatch.setattr(handler.urllib.request, "urlopen", urlopen)
+
+        with pytest.raises(urllib.error.HTTPError):
+            handler.github_get("https://api.github.com/user", "ghp_token")
+
+        assert len(attempts) == 1
+
+    def test_sends_the_token_as_a_bearer_header(self, monkeypatch):
+        captured = []
+
+        def urlopen(request, timeout=30):
+            captured.append(request)
+            return self.response({})
+
+        monkeypatch.setattr(handler.urllib.request, "urlopen", urlopen)
+
+        handler.github_get("https://api.github.com/user", "ghp_token")
+
+        assert captured[0].get_header("Authorization") == "Bearer ghp_token"

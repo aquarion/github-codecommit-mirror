@@ -200,6 +200,11 @@ variable "log_level" {
   description = "Python log level for the function."
   type        = string
   default     = "INFO"
+
+  validation {
+    condition     = contains(["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"], var.log_level)
+    error_message = "log_level must be one of CRITICAL, ERROR, WARNING, INFO or DEBUG."
+  }
 }
 
 # --------------------------------------------------------------------------

@@ -33,8 +33,7 @@ locals {
     : (local.email_alerts_enabled ? aws_sns_topic.alerts[0].arn : null)
   )
 
-  # CreateRepository and ListRepositories have no resource-level permissions;
-  # everything else is scoped to the names this stack owns.
+  # Everything except ListRepositories is scoped to the names this stack owns.
   codecommit_repository_arn_pattern = "arn:${data.aws_partition.current.partition}:codecommit:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${var.codecommit_name_prefix}*"
 }
 

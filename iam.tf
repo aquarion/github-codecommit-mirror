@@ -28,11 +28,16 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   statement {
-    sid = "CreateAndListMirrors"
-    actions = [
-      "codecommit:CreateRepository",
-      "codecommit:ListRepositories",
-    ]
+    sid       = "CreateMirrors"
+    actions   = ["codecommit:CreateRepository"]
+    resources = [local.codecommit_repository_arn_pattern]
+  }
+
+  # ListRepositories is the one action here with no resource-level support:
+  # "The only allowed value for Resource for this action is all repositories".
+  statement {
+    sid       = "ListMirrors"
+    actions   = ["codecommit:ListRepositories"]
     resources = ["*"]
   }
 

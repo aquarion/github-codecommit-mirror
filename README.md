@@ -162,7 +162,10 @@ Lambda environment — owners, alert addresses, region.
   `time_budget_seconds` remains, the function invokes itself asynchronously with
   the repositories it has not reached, up to `max_continuations` times. Each
   invocation always completes at least one repository, so a run cannot loop
-  without making progress.
+  without making progress — a property the tests pin down directly. If the
+  handover cannot happen at all (the continuation cap, an oversized payload, a
+  failed invoke), those repositories are counted as `Deferred` and the run fails
+  loudly rather than reporting success while quietly skipping them.
 * **Each repository is cloned fresh** into `/tmp` and deleted afterwards, so
   disk use is bounded by the largest single repository, not the total. Anything
   the GitHub API reports as larger than `max_repo_size_mb` is skipped rather
@@ -265,9 +268,11 @@ at all.
 
 ## Monitoring
 
-Each run publishes `Mirrored`, `Empty`, `Skipped` and `Failed` counts to the
-CloudWatch namespace named after the stack (`github-codecommit-mirror` by
-default). A repository that fails does not stop the run — the other repositories
+Each run publishes `Mirrored`, `Empty`, `Skipped`, `Failed` and `Deferred`
+counts to the CloudWatch namespace named after the stack
+(`github-codecommit-mirror` by default). `Deferred` is repositories a run
+neither mirrored nor managed to hand to a continuation — it should always be
+zero, and a run that records any fails so the alert fires. A repository that fails does not stop the run — the other repositories
 are still mirrored, and the invocation fails at the end with the list of names,
 which surfaces as a Lambda `Errors` data point.
 
@@ -290,8 +295,10 @@ that already succeeded, and the next scheduled run picks the work up anyway.
   CodeBuild.
 * **Around 1,700 repositories** is the practical ceiling for one scheduled run,
   because the continuation payload has to fit Lambda's 256 KB asynchronous
-  invocation limit. Past that, split the work with `include_pattern` across
-  several deployments.
+  invocation limit. The function checks the payload before invoking, so crossing
+  the line reports the repositories as `Deferred` and fails the run with an
+  explanation rather than throwing a raw `RequestEntityTooLargeException`. Past
+  that, split the work with `include_pattern` across several deployments.
 * **A fresh clone every run** means bandwidth scales with total repository size,
   not with what changed. For very large estates, run it less often.
 

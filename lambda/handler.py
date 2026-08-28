@@ -27,10 +27,15 @@ import urllib.parse
 import urllib.request
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 LOG = logging.getLogger()
-LOG.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+# An unknown level would raise at import, before any error handling exists.
+try:
+    LOG.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+except ValueError:
+    LOG.setLevel("INFO")
+    LOG.warning("Ignoring unknown LOG_LEVEL %r", os.environ.get("LOG_LEVEL"))
 
 GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 GITHUB_TOKEN_SECRET_ARN = os.environ["GITHUB_TOKEN_SECRET_ARN"]
@@ -121,7 +126,13 @@ def github_token() -> str:
                 f"{GITHUB_TOKEN_SECRET_ARN} --secret-string <token>"
             ) from error
 
-        raw = secret["SecretString"].strip()
+        raw = secret.get("SecretString", "").strip()
+        if not raw:
+            raise RuntimeError(
+                f"The value stored in {GITHUB_TOKEN_SECRET_ARN} is empty. Set the "
+                "GitHub token with: aws secretsmanager put-secret-value "
+                f"--secret-id {GITHUB_TOKEN_SECRET_ARN} --secret-string <token>"
+            )
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
@@ -467,7 +478,7 @@ def _run(event, context, report: dict):
     if pending is None:
         pending = list_github_repositories(token)
 
-    counts = {"mirrored": 0, "empty": 0, "skipped": 0, "failed": 0}
+    counts = {"mirrored": 0, "empty": 0, "skipped": 0, "failed": 0, "deferred": 0}
     failures: list[str] = []
     remaining: list[dict] = []
     report["counts"] = counts
@@ -484,17 +495,29 @@ def _run(event, context, report: dict):
             failures.append(repo["full_name"])
             LOG.exception("Failed to mirror %s: %s", repo["full_name"], _scrub(str(error)))
 
+    # Before the metrics: telemetry must never be able to cost us the handover
+    # of work that has not been done yet.
+    if remaining:
+        counts["deferred"] = _continue(context, remaining, continuation)
+
     _publish_metrics(counts)
     summary = {**counts, "remaining": len(remaining), "continuation": continuation}
     LOG.info("Run summary: %s", json.dumps(summary))
 
-    if remaining:
-        _continue(context, remaining, continuation)
-
+    problems = []
     if failures:
-        raise RuntimeError(
+        problems.append(
             f"{len(failures)} repositories failed to mirror: {', '.join(failures[:20])}"
         )
+    if counts["deferred"]:
+        # Not handed on and not mirrored: without raising, the run reports
+        # success while those repositories were quietly skipped.
+        problems.append(
+            f"{counts['deferred']} repositories were not mirrored and could not be "
+            "handed to a continuation"
+        )
+    if problems:
+        raise RuntimeError("; ".join(problems))
     return summary
 
 
@@ -504,22 +527,51 @@ def _out_of_time(context) -> bool:
     return context.get_remaining_time_in_millis() < TIME_BUDGET_SECONDS * 1000
 
 
-def _continue(context, remaining: list[dict], continuation: int) -> None:
-    """Hand the rest of the work to a fresh asynchronous invocation."""
+# Lambda's asynchronous invocation payload limit, with room for the envelope.
+MAX_ASYNC_PAYLOAD_BYTES = 250_000
+
+
+def _continue(context, remaining: list[dict], continuation: int) -> int:
+    """Hand the rest of the work to a fresh invocation.
+
+    Returns the number of repositories that could NOT be handed on, so the
+    caller can report them rather than let them disappear.
+    """
     if continuation >= MAX_CONTINUATIONS:
         LOG.error(
-            "Reached MAX_CONTINUATIONS (%s) with %s repositories left; they will be "
-            "picked up on the next scheduled run",
+            "Reached MAX_CONTINUATIONS (%s) with %s repositories left; they are not "
+            "mirrored this run",
             MAX_CONTINUATIONS, len(remaining),
         )
-        return
+        return len(remaining)
+
+    payload = json.dumps({"pending": remaining, "continuation": continuation + 1}).encode()
+    if len(payload) > MAX_ASYNC_PAYLOAD_BYTES:
+        # Raising here would discard the batch already mirrored and fail
+        # identically on every future run; reporting lets the operator act.
+        LOG.error(
+            "Continuation payload for %s repositories is %s bytes, over Lambda's "
+            "asynchronous limit; narrow the run with include_pattern or "
+            "exclude_pattern, or split it across deployments",
+            len(remaining), len(payload),
+        )
+        return len(remaining)
 
     LOG.info("Out of time: continuing with %s repositories", len(remaining))
-    lambda_client.invoke(
-        FunctionName=context.invoked_function_arn,
-        InvocationType="Event",
-        Payload=json.dumps({"pending": remaining, "continuation": continuation + 1}).encode(),
-    )
+    try:
+        lambda_client.invoke(
+            FunctionName=context.invoked_function_arn,
+            InvocationType="Event",
+            Payload=payload,
+        )
+    except (ClientError, BotoCoreError):
+        LOG.exception(
+            "Could not invoke the continuation for %s repositories (%s bytes)",
+            len(remaining), len(payload),
+        )
+        return len(remaining)
+
+    return 0
 
 
 def _ses():
@@ -598,5 +650,5 @@ def _publish_metrics(counts: dict) -> None:
                 for name, value in counts.items()
             ],
         )
-    except ClientError as error:
-        LOG.warning("Could not publish metrics: %s", error)
+    except (ClientError, BotoCoreError):
+        LOG.exception("Could not publish metrics")
