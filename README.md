@@ -91,7 +91,15 @@ aws lambda invoke \
   --invocation-type Event \
   --payload '{}' --cli-binary-format raw-in-base64-out /dev/null
 
-aws logs tail "$(terraform output -raw log_group_name)" --follow
+# --since matters: tail shows only the last 10 minutes by default, so a run
+# from earlier looks like an empty log group.
+aws logs tail "$(terraform output -raw log_group_name)" --since 1h --follow
+```
+
+To look at a run that has already finished:
+
+```shell
+aws logs tail "$(terraform output -raw log_group_name)" --since 3h --format short
 ```
 
 `--invocation-type Event` matters. A run can take the full 15 minutes, while the
