@@ -83,12 +83,36 @@ To point at a secret you already manage instead, set
 
 ### Run it without waiting for the schedule
 
+Invoke it **asynchronously** and watch the logs:
+
 ```shell
 aws lambda invoke \
   --function-name "$(terraform output -raw lambda_function_name)" \
-  --payload '{}' --cli-binary-format raw-in-base64-out /dev/stdout
+  --invocation-type Event \
+  --payload '{}' --cli-binary-format raw-in-base64-out /dev/null
 
 aws logs tail "$(terraform output -raw log_group_name)" --follow
+```
+
+`--invocation-type Event` matters. A run can take the full 15 minutes, while the
+AWS CLI gives up reading a synchronous response after 60 seconds and then
+*retries* — each retry starting another run alongside the one still going. Two
+of those exhaust the reserved concurrency and the third fails with:
+
+```
+TooManyRequestsException ... (reached max retries: 2): Rate Exceeded
+Reason: ReservedFunctionConcurrentInvocationLimitExceeded
+```
+
+which looks like a deployment problem but is just the CLI competing with itself.
+If you do want to wait for the result synchronously, disable the client timeout
+so it cannot retry:
+
+```shell
+AWS_MAX_ATTEMPTS=1 aws lambda invoke \
+  --function-name "$(terraform output -raw lambda_function_name)" \
+  --cli-read-timeout 0 \
+  --payload '{}' --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
 ## State

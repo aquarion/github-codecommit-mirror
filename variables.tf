@@ -168,7 +168,11 @@ variable "lambda_reserved_concurrency" {
   description = <<-EOT
     Reserved concurrency for the function. Keep at least 2 so a run that is
     running out of time can immediately hand the remaining repositories to a
-    continuation invocation. Set to -1 to use unreserved concurrency.
+    continuation invocation. This is a ceiling on everything, manual invocations
+    included: invoking by hand while a scheduled run and its continuation are in
+    flight is throttled with ReservedFunctionConcurrentInvocationLimitExceeded,
+    which is the limit working as intended. Set to -1 to use unreserved
+    concurrency.
   EOT
   type        = number
   default     = 2
