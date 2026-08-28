@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here needs to write. Without this the workflow inherits the
+# repository default, which on many repositories is read/write.
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.3
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          for dir in . bootstrap; do
+            echo "==> $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+  tests:
+    name: Lambda tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3 pytest
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+  image:
+    name: Lambda image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Not pushed anywhere: this only proves the image still builds.
+      - name: Build
+        run: docker build --platform linux/amd64 -t github-codecommit-mirror:ci lambda
