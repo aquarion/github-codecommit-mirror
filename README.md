@@ -17,30 +17,18 @@ EventBridge (rate(1 day))
    CodeCommit (one private repository per GitHub repository)
 ```
 
-## Before you start: is CodeCommit available to you?
+## A note on CodeCommit's availability
 
-**AWS closed CodeCommit to new customers in July 2024.** If your AWS account had
-not created a CodeCommit repository before then, `CreateRepository` fails and
-nothing here will work — that is an account-level restriction, not something the
-Terraform can route around. Accounts that were already using CodeCommit keep
-full access, including creating new repositories.
-
-Check before you spend time on it:
-
-```shell
-aws codecommit list-repositories --region eu-west-1
-# then, in a throwaway repo name:
-aws codecommit create-repository --repository-name scratch-mirror-check --region eu-west-1
-aws codecommit delete-repository --repository-name scratch-mirror-check --region eu-west-1
-```
-
-If that create fails with an access or availability error, see
-[Alternatives](#if-codecommit-is-not-available-to-you) at the bottom.
+AWS closed CodeCommit to new customers in July 2024, and a lot of writing from
+that period still says the service is a dead end. That changed: CodeCommit
+[returned to general availability on 24 November 2025](https://aws.amazon.com/blogs/devops/aws-codecommit-returns-to-general-availability/).
+New accounts can create repositories again, and AWS has committed to continued
+support and regional expansion.
 
 ## What you need
 
-* An AWS account with CodeCommit access (see above) and credentials that can
-  create IAM roles, Lambda functions, ECR repositories and EventBridge rules.
+* An AWS account with credentials that can create IAM roles, Lambda functions,
+  ECR repositories, CodeCommit repositories and EventBridge rules.
 * Terraform >= 1.5.
 * Docker, to build the Lambda container image. The function needs the `git`
   binary, which is not in the zip runtimes, so it ships as an image. If you would
@@ -151,8 +139,12 @@ Set `alarm_sns_topic_arn` to get alarms on both signals.
 
 ## Limits worth knowing
 
-* **Git LFS is not mirrored.** LFS objects live outside the git object store;
-  the pointer files are mirrored, the blobs are not.
+* **Git LFS is not mirrored.** LFS objects live outside the git object store, so
+  `clone --mirror` copies the pointer files and not the blobs. Adding it would
+  mean `git lfs fetch --all` and `git lfs push --all` around the existing
+  commands, plus the `git-lfs` binary in the image. AWS announced LFS support
+  for CodeCommit during 2026; check whether it has landed in your region before
+  relying on it.
 * **Issues, pull requests, wikis, releases and Actions history are not
   mirrored.** This copies git, not GitHub.
 * **Very large repositories** may not finish a clone and push inside 15 minutes,
@@ -185,10 +177,10 @@ terraform init -backend=false && terraform validate
 
 Both run in CI on every push.
 
-## If CodeCommit is not available to you
+## Mirroring somewhere other than CodeCommit
 
 The same handler works with very little change against any git host that takes a
-`git push --mirror`:
+`git push --mirror`, if CodeCommit turns out not to suit you:
 
 * **CodeBuild instead of Lambda** — no 15 minute ceiling and much more disk, at
   the cost of slower starts. The clone and push commands are identical.
