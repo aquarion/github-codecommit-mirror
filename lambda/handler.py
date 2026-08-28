@@ -33,8 +33,6 @@ LOG = logging.getLogger()
 LOG.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 GITHUB_API_URL = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-GITHUB_OWNER = os.environ["GITHUB_OWNER"]
-GITHUB_OWNER_TYPE = os.environ.get("GITHUB_OWNER_TYPE", "user").lower()
 GITHUB_TOKEN_SECRET_ARN = os.environ["GITHUB_TOKEN_SECRET_ARN"]
 
 CODECOMMIT_REGION = os.environ.get("CODECOMMIT_REGION") or os.environ["AWS_REGION"]
@@ -54,6 +52,32 @@ METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "GitHubCodeCommitMirror")
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/mirror")
 GIT_CREDENTIALS_FILE = "/tmp/.git-credentials"
 
+def _parse_owners(raw: str) -> list[dict]:
+    """GITHUB_OWNERS is JSON: [{"name": "octocat", "type": "user"}, ...]."""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"GITHUB_OWNERS is not valid JSON: {error}") from error
+
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError("GITHUB_OWNERS must be a non-empty JSON array")
+
+    owners = []
+    for entry in parsed:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            raise ValueError(f"GITHUB_OWNERS entry needs a 'name': {entry!r}")
+        owner_type = str(entry.get("type", "user")).lower()
+        if owner_type not in ("user", "org"):
+            raise ValueError(
+                f"GITHUB_OWNERS entry {entry['name']!r} has type {owner_type!r}; "
+                "expected 'user' or 'org'"
+            )
+        owners.append({"name": str(entry["name"]), "type": owner_type})
+    return owners
+
+
+GITHUB_OWNERS = _parse_owners(os.environ["GITHUB_OWNERS"])
+
 # CodeCommit accepts [\w\.-]{1,100}.
 _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 _MAX_CC_NAME = 100
@@ -64,6 +88,7 @@ cloudwatch = boto3.client("cloudwatch")
 lambda_client = boto3.client("lambda")
 
 _token_cache: str | None = None
+_viewer_cache: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -142,36 +167,58 @@ def _redact_url(url: str) -> str:
     return re.sub(r"//[^@/]+@", "//***@", url)
 
 
-def list_github_repositories(token: str) -> list[dict]:
-    """List every repository owned by GITHUB_OWNER that passes the filters."""
-    if GITHUB_OWNER_TYPE == "org":
-        url = f"{GITHUB_API_URL}/orgs/{GITHUB_OWNER}/repos?per_page=100&type=all"
-    else:
+def _viewer_login(token: str) -> str:
+    """Login of the account the token belongs to, fetched once per container."""
+    global _viewer_cache
+    if _viewer_cache is None:
         viewer, _ = github_get(f"{GITHUB_API_URL}/user", token)
-        if str(viewer.get("login", "")).lower() == GITHUB_OWNER.lower():
-            # /user/repos is the only listing that includes private repos.
-            url = (
-                f"{GITHUB_API_URL}/user/repos"
-                f"?per_page=100&affiliation=owner&visibility={VISIBILITY}"
-            )
-        else:
-            LOG.warning(
-                "Token belongs to %s, not %s; only public repositories are visible",
-                viewer.get("login"), GITHUB_OWNER,
-            )
-            url = f"{GITHUB_API_URL}/users/{GITHUB_OWNER}/repos?per_page=100&type=owner"
+        _viewer_cache = str(viewer.get("login", ""))
+    return _viewer_cache
 
-    repositories: list[dict] = []
-    while url:
-        page, headers = github_get(url, token)
-        repositories.extend(page)
-        url = _next_link(headers.get("Link", ""))
 
-    selected = [repo for repo in repositories if _wanted(repo)]
-    selected.sort(key=lambda repo: repo["full_name"].lower())
+def _listing_url(owner: dict, token: str) -> str:
+    """Pick the listing endpoint that shows the most of this owner's repos."""
+    name = owner["name"]
+    if owner["type"] == "org":
+        return f"{GITHUB_API_URL}/orgs/{name}/repos?per_page=100&type=all"
+
+    if _viewer_login(token).lower() == name.lower():
+        # /user/repos is the only listing that includes a user's private repos.
+        return (
+            f"{GITHUB_API_URL}/user/repos"
+            f"?per_page=100&affiliation=owner&visibility={VISIBILITY}"
+        )
+
+    LOG.warning(
+        "Token belongs to %s, not %s; only public repositories of %s are visible",
+        _viewer_login(token), name, name,
+    )
+    return f"{GITHUB_API_URL}/users/{name}/repos?per_page=100&type=owner"
+
+
+def list_github_repositories(token: str) -> list[dict]:
+    """List every repository of every configured owner that passes the filters."""
+    selected: dict[str, dict] = {}
+    seen = 0
+
+    for owner in GITHUB_OWNERS:
+        url = _listing_url(owner, token)
+        while url:
+            page, headers = github_get(url, token)
+            seen += len(page)
+            for repo in page:
+                # An owner listed twice, or a repo visible through two listings,
+                # must still only be mirrored once.
+                if _wanted(repo, owner["name"]):
+                    selected[repo["full_name"]] = repo
+            url = _next_link(headers.get("Link", ""))
+
+        LOG.info("Listed %s (%s)", owner["name"], owner["type"])
+
+    ordered = sorted(selected.values(), key=lambda repo: repo["full_name"].lower())
     LOG.info(
-        "GitHub returned %s repositories, %s selected for mirroring",
-        len(repositories), len(selected),
+        "GitHub returned %s repositories across %s owners, %s selected for mirroring",
+        seen, len(GITHUB_OWNERS), len(ordered),
     )
     return [
         {
@@ -180,7 +227,7 @@ def list_github_repositories(token: str) -> list[dict]:
             "description": repo.get("description") or "",
             "size_kb": repo.get("size") or 0,
         }
-        for repo in selected
+        for repo in ordered
     ]
 
 
@@ -194,10 +241,10 @@ def _next_link(link_header: str) -> str | None:
     return None
 
 
-def _wanted(repo: dict) -> bool:
+def _wanted(repo: dict, expected_owner: str) -> bool:
     name = repo["full_name"]
     owner = (repo.get("owner") or {}).get("login", "")
-    if owner.lower() != GITHUB_OWNER.lower():
+    if owner.lower() != expected_owner.lower():
         return False
     if repo.get("fork") and not INCLUDE_FORKS:
         LOG.debug("Skipping fork %s", name)

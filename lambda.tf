@@ -22,8 +22,7 @@ resource "aws_lambda_function" "mirror" {
 
   environment {
     variables = {
-      GITHUB_OWNER            = var.github_owner
-      GITHUB_OWNER_TYPE       = var.github_owner_type
+      GITHUB_OWNERS           = jsonencode(var.github_owners)
       GITHUB_API_URL          = var.github_api_url
       GITHUB_TOKEN_SECRET_ARN = local.github_token_secret_arn
       CODECOMMIT_REGION       = var.aws_region

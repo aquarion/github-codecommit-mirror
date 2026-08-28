@@ -22,19 +22,40 @@ variable "tags" {
 # --------------------------------------------------------------------------
 # GitHub
 # --------------------------------------------------------------------------
-variable "github_owner" {
-  description = "GitHub user or organisation whose repositories are mirrored."
-  type        = string
-}
+variable "github_owners" {
+  description = <<-EOT
+    The accounts whose repositories are mirrored, each with its type. One
+    deployment can mirror a personal account and any number of organisations:
 
-variable "github_owner_type" {
-  description = "Whether github_owner is a 'user' or an 'org'."
-  type        = string
-  default     = "user"
+      github_owners = [
+        { name = "aquarion", type = "user" },
+        { name = "bb-cli",   type = "org" },
+      ]
+
+    The token needs access to all of them. A classic PAT with 'repo' (and
+    'read:org' for organisations) covers several owners at once; fine-grained
+    tokens are scoped to a single account, so mirroring owners that need
+    separate tokens means a separate deployment per token.
+  EOT
+
+  type = list(object({
+    name = string
+    type = optional(string, "user")
+  }))
 
   validation {
-    condition     = contains(["user", "org"], var.github_owner_type)
-    error_message = "github_owner_type must be either 'user' or 'org'."
+    condition     = length(var.github_owners) > 0
+    error_message = "github_owners must list at least one account."
+  }
+
+  validation {
+    condition     = alltrue([for owner in var.github_owners : contains(["user", "org"], owner.type)])
+    error_message = "Each github_owners entry must have type 'user' or 'org'."
+  }
+
+  validation {
+    condition     = length(distinct([for owner in var.github_owners : lower(owner.name)])) == length(var.github_owners)
+    error_message = "github_owners must not list the same account twice."
   }
 }
 

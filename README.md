@@ -33,9 +33,12 @@ support and regional expansion.
 * Docker, to build the Lambda container image. The function needs the `git`
   binary, which is not in the zip runtimes, so it ships as an image. If you would
   rather build in CI, set `build_and_push_image = false` and pass `image_tag`.
-* A GitHub token with `repo` scope (classic) or a fine-grained token with
-  read-only **Contents** and **Metadata** access to the repositories you want
-  mirrored. Read-only is enough — nothing is ever written back to GitHub.
+* A GitHub token that can read every account you are mirroring: a classic PAT
+  with `repo` (plus `read:org` for organisations), or a fine-grained token with
+  read-only **Contents** and **Metadata**. Read-only is enough — nothing is ever
+  written back to GitHub. See
+  [Mirroring several accounts](#mirroring-several-accounts) if one token cannot
+  reach them all.
 
 ## Deploy
 
@@ -102,6 +105,42 @@ and `github_token_secret_arn = "arn:aws:secretsmanager:..."`.
   the GitHub API reports as larger than `max_repo_size_mb` is skipped rather
   than risking a full disk mid-run.
 
+## Mirroring several accounts
+
+One deployment handles a personal account and any number of organisations:
+
+```hcl
+github_owners = [
+  { name = "aquarion", type = "user" },
+  { name = "bb-cli",   type = "org" },
+]
+```
+
+Each account is listed through the endpoint that reveals the most of it —
+`/user/repos` for the token's own account, which is the only listing that
+includes a user's private repositories, and `/orgs/<name>/repos` for an
+organisation. Repositories are filtered back to the account being listed, so an
+organisation you merely belong to does not get pulled in by your personal
+listing, and a repository visible through two listings is mirrored once.
+
+Mirror names already carry the owner (`gh-aquarion-api`, `gh-bb-cli-api`), so
+two accounts with a same-named repository do not collide.
+
+The catch is the token. A classic PAT with `repo` and `read:org` reaches
+several accounts at once, but **fine-grained tokens are scoped to a single
+account** — if your personal repositories and your organisation need separate
+fine-grained tokens, run a deployment per token, giving each its own `name` and
+`codecommit_name_prefix`:
+
+```hcl
+name                   = "github-mirror-myorg"
+codecommit_name_prefix = "gh-myorg-"
+```
+
+Separate deployments are also the right answer when you want different
+schedules or filters per account, at the cost of an ECR repository and image
+per deployment.
+
 ## Configuration
 
 Every variable is documented in [`variables.tf`](variables.tf). The ones worth
@@ -109,8 +148,7 @@ knowing about:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `github_owner` | *required* | User or organisation to mirror. |
-| `github_owner_type` | `user` | `user` or `org`. |
+| `github_owners` | *required* | Accounts to mirror: `[{ name = "you", type = "user" }, { name = "your-org", type = "org" }]`. |
 | `visibility` | `all` | `all`, `public` or `private`. |
 | `include_forks` / `include_archived` | `false` | Off by default. |
 | `include_pattern` / `exclude_pattern` | none | Regexes matched against `owner/repo`. |

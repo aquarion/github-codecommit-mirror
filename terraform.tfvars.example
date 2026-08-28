@@ -2,9 +2,12 @@
 
 aws_region = "eu-west-1"
 
-# Whose repositories to mirror.
-github_owner      = "aquarion"
-github_owner_type = "user" # or "org"
+# Whose repositories to mirror. A personal account and any number of
+# organisations can share one deployment, as long as one token reaches them all.
+github_owners = [
+  { name = "aquarion", type = "user" },
+  # { name = "my-org", type = "org" },
+]
 
 # What to mirror. The defaults skip forks and archived repositories.
 visibility       = "all"

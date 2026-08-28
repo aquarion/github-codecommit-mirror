@@ -6,8 +6,9 @@ from pathlib import Path
 
 os.environ.setdefault("AWS_REGION", "eu-west-1")
 os.environ.setdefault("AWS_DEFAULT_REGION", "eu-west-1")
-os.environ.setdefault("GITHUB_OWNER", "octocat")
-os.environ.setdefault("GITHUB_OWNER_TYPE", "user")
+os.environ.setdefault(
+    "GITHUB_OWNERS", '[{"name": "octocat", "type": "user"}]'
+)
 os.environ.setdefault(
     "GITHUB_TOKEN_SECRET_ARN",
     "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-token-AbCdEf",

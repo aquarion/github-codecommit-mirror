@@ -41,24 +41,31 @@ class TestRepositoryFilters:
         base.update(overrides)
         return base
 
+    def wanted(self, expected_owner="octocat", **overrides):
+        return handler._wanted(self.repo(**overrides), expected_owner)
+
     def test_keeps_a_plain_repository(self):
-        assert handler._wanted(self.repo())
+        assert self.wanted()
 
     def test_drops_repositories_owned_by_someone_else(self):
-        assert not handler._wanted(
-            self.repo(full_name="other/thing", owner={"login": "other"})
-        )
+        assert not self.wanted(full_name="other/thing", owner={"login": "other"})
 
     def test_owner_comparison_ignores_case(self):
-        assert handler._wanted(self.repo(owner={"login": "OctoCat"}))
+        assert self.wanted(owner={"login": "OctoCat"})
+
+    def test_matches_against_the_owner_being_listed(self):
+        org_repo = self.repo(full_name="acme/thing", owner={"login": "acme"})
+
+        assert handler._wanted(org_repo, "acme")
+        assert not handler._wanted(org_repo, "octocat")
 
     def test_drops_forks_and_archived_repositories_by_default(self):
-        assert not handler._wanted(self.repo(fork=True))
-        assert not handler._wanted(self.repo(archived=True))
+        assert not self.wanted(fork=True)
+        assert not self.wanted(archived=True)
 
     def test_keeps_forks_when_configured(self, monkeypatch):
         monkeypatch.setattr(handler, "INCLUDE_FORKS", True)
-        assert handler._wanted(self.repo(fork=True))
+        assert self.wanted(fork=True)
 
     @pytest.mark.parametrize(
         "visibility,private,expected",
@@ -73,16 +80,16 @@ class TestRepositoryFilters:
     )
     def test_visibility_filter(self, monkeypatch, visibility, private, expected):
         monkeypatch.setattr(handler, "VISIBILITY", visibility)
-        assert handler._wanted(self.repo(private=private)) is expected
+        assert self.wanted(private=private) is expected
 
     def test_include_and_exclude_patterns(self, monkeypatch):
         monkeypatch.setattr(handler, "INCLUDE_PATTERN", r"hello")
-        assert handler._wanted(self.repo())
-        assert not handler._wanted(self.repo(full_name="octocat/goodbye"))
+        assert self.wanted()
+        assert not self.wanted(full_name="octocat/goodbye")
 
         monkeypatch.setattr(handler, "INCLUDE_PATTERN", None)
         monkeypatch.setattr(handler, "EXCLUDE_PATTERN", r"^octocat/hello")
-        assert not handler._wanted(self.repo())
+        assert not self.wanted()
 
 
 class TestPagination:
@@ -275,3 +282,157 @@ class TestConfigureGit:
         handler.configure_git("ghp_token")
 
         assert credentials.read_text().endswith("@ghe.example.com\n")
+
+
+class TestOwnerParsing:
+    def test_reads_a_list_of_owners(self):
+        owners = handler._parse_owners(
+            '[{"name": "octocat"}, {"name": "acme", "type": "org"}]'
+        )
+        assert owners == [
+            {"name": "octocat", "type": "user"},
+            {"name": "acme", "type": "org"},
+        ]
+
+    def test_type_defaults_to_user(self):
+        assert handler._parse_owners('[{"name": "octocat"}]')[0]["type"] == "user"
+
+    @pytest.mark.parametrize(
+        "raw,message",
+        [
+            ("not json", "not valid JSON"),
+            ("[]", "non-empty JSON array"),
+            ('{"name": "octocat"}', "non-empty JSON array"),
+            ('[{"type": "org"}]', "needs a 'name'"),
+            ('[{"name": "acme", "type": "team"}]', "expected 'user' or 'org'"),
+        ],
+    )
+    def test_rejects_bad_configuration(self, raw, message):
+        with pytest.raises(ValueError, match=message):
+            handler._parse_owners(raw)
+
+
+class TestListingAcrossOwners:
+    """A personal account and an organisation in one run."""
+
+    def owners(self, monkeypatch):
+        monkeypatch.setattr(
+            handler,
+            "GITHUB_OWNERS",
+            [{"name": "octocat", "type": "user"}, {"name": "acme", "type": "org"}],
+        )
+        monkeypatch.setattr(handler, "_viewer_cache", "octocat")
+
+    def repo(self, full_name, **overrides):
+        owner, name = full_name.split("/")
+        base = {
+            "full_name": full_name,
+            "name": name,
+            "owner": {"login": owner},
+            "clone_url": f"https://github.com/{full_name}.git",
+            "description": "",
+            "size": 10,
+            "fork": False,
+            "archived": False,
+            "private": False,
+        }
+        base.update(overrides)
+        return base
+
+    def fake_github(self, pages):
+        """pages: {url_fragment: (payload, link_header)}"""
+        def github_get(url, token, attempts=5):
+            for fragment, (payload, link) in pages.items():
+                if fragment in url:
+                    return payload, {"Link": link}
+            raise AssertionError(f"unexpected URL {url}")
+        return github_get
+
+    def test_mirrors_repositories_from_both_owners(self, monkeypatch):
+        self.owners(monkeypatch)
+        monkeypatch.setattr(
+            handler,
+            "github_get",
+            self.fake_github({
+                "/user/repos": ([self.repo("octocat/personal")], ""),
+                "/orgs/acme/repos": ([self.repo("acme/service")], ""),
+            }),
+        )
+
+        names = [repo["full_name"] for repo in handler.list_github_repositories("t")]
+
+        assert names == ["acme/service", "octocat/personal"]
+
+    def test_uses_the_org_endpoint_for_organisations(self, monkeypatch):
+        self.owners(monkeypatch)
+        requested = []
+
+        def github_get(url, token, attempts=5):
+            requested.append(url)
+            return [], {"Link": ""}
+
+        monkeypatch.setattr(handler, "github_get", github_get)
+        handler.list_github_repositories("t")
+
+        assert any("/user/repos" in url for url in requested)
+        assert any("/orgs/acme/repos" in url for url in requested)
+
+    def test_follows_pagination_per_owner(self, monkeypatch):
+        self.owners(monkeypatch)
+        monkeypatch.setattr(
+            handler,
+            "github_get",
+            self.fake_github({
+                "/user/repos?page=2": ([self.repo("octocat/second")], ""),
+                "/user/repos": (
+                    [self.repo("octocat/first")],
+                    '<https://api.github.com/user/repos?page=2>; rel="next"',
+                ),
+                "/orgs/acme/repos": ([], ""),
+            }),
+        )
+
+        names = [repo["full_name"] for repo in handler.list_github_repositories("t")]
+
+        assert names == ["octocat/first", "octocat/second"]
+
+    def test_a_repository_visible_twice_is_mirrored_once(self, monkeypatch):
+        self.owners(monkeypatch)
+        shared = self.repo("acme/service")
+        monkeypatch.setattr(
+            handler,
+            "github_get",
+            self.fake_github({
+                # An org repo the user also has owner affiliation on.
+                "/user/repos": ([shared], ""),
+                "/orgs/acme/repos": ([shared], ""),
+            }),
+        )
+
+        names = [repo["full_name"] for repo in handler.list_github_repositories("t")]
+
+        assert names == ["acme/service"]
+
+    def test_each_owner_only_keeps_its_own_repositories(self, monkeypatch):
+        self.owners(monkeypatch)
+        monkeypatch.setattr(
+            handler,
+            "github_get",
+            self.fake_github({
+                # A repo from an org the user merely belongs to.
+                "/user/repos": (
+                    [self.repo("octocat/mine"), self.repo("someone-else/theirs")],
+                    "",
+                ),
+                "/orgs/acme/repos": ([], ""),
+            }),
+        )
+
+        names = [repo["full_name"] for repo in handler.list_github_repositories("t")]
+
+        assert names == ["octocat/mine"]
+
+    def test_owners_get_distinct_codecommit_names(self):
+        assert handler.codecommit_name("octocat/api") != handler.codecommit_name(
+            "acme/api"
+        )
