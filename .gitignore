@@ -12,9 +12,10 @@ override.tf.json
 .terraformrc
 terraform.rc
 
-# Local variable files may contain account-specific values
+# Local files holding account-specific values
 *.auto.tfvars
 terraform.tfvars
+backend.hcl
 
 # Python
 __pycache__/

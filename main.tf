@@ -47,6 +47,10 @@ resource "terraform_data" "validate_configuration" {
   }
 }
 
+# Created empty, with no version. The token is written out of band with the AWS
+# CLI, so it never passes through Terraform and never lands in state. Terraform
+# deliberately does not manage a version here: one pinned to a version AWS later
+# prunes would be recreated on a subsequent apply, overwriting the real token.
 resource "aws_secretsmanager_secret" "github_token" {
   count = var.create_github_token_secret ? 1 : 0
 
@@ -55,15 +59,3 @@ resource "aws_secretsmanager_secret" "github_token" {
   kms_key_id  = var.github_token_secret_kms_key_id
 }
 
-# Placeholder only. The real token is written out of band with the AWS CLI, and
-# Terraform ignores the value from then on so it never enters the state file.
-resource "aws_secretsmanager_secret_version" "github_token_placeholder" {
-  count = var.create_github_token_secret ? 1 : 0
-
-  secret_id     = aws_secretsmanager_secret.github_token[0].id
-  secret_string = "REPLACE_ME"
-
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
-}

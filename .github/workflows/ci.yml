@@ -21,8 +21,11 @@ jobs:
 
       - name: Validate
         run: |
-          terraform init -backend=false -input=false
-          terraform validate
+          for dir in . bootstrap; do
+            echo "==> $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
 
   tests:
     name: Lambda tests

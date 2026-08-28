@@ -589,3 +589,33 @@ class TestFailureAlerting:
         )
 
         assert summary["mirrored"] == 1
+
+
+class TestMissingSecretValue:
+    def test_says_how_to_set_a_token_that_was_never_written(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", None)
+
+        def missing(**_):
+            raise handler.ClientError(
+                {"Error": {"Code": "ResourceNotFoundException", "Message": "nope"}},
+                "GetSecretValue",
+            )
+
+        monkeypatch.setattr(handler.secretsmanager, "get_secret_value", missing)
+
+        with pytest.raises(RuntimeError, match="put-secret-value"):
+            handler.github_token()
+
+    def test_other_secrets_manager_errors_are_not_swallowed(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", None)
+
+        def denied(**_):
+            raise handler.ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "GetSecretValue",
+            )
+
+        monkeypatch.setattr(handler.secretsmanager, "get_secret_value", denied)
+
+        with pytest.raises(handler.ClientError):
+            handler.github_token()

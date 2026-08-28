@@ -108,7 +108,19 @@ def github_token() -> str:
     """Read the GitHub token from Secrets Manager, cached for the container."""
     global _token_cache
     if _token_cache is None:
-        secret = secretsmanager.get_secret_value(SecretId=GITHUB_TOKEN_SECRET_ARN)
+        try:
+            secret = secretsmanager.get_secret_value(SecretId=GITHUB_TOKEN_SECRET_ARN)
+        except ClientError as error:
+            if error.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+            # Terraform creates the secret empty, so this is what a deployment
+            # that has not had its token set yet looks like.
+            raise RuntimeError(
+                f"No value stored in {GITHUB_TOKEN_SECRET_ARN}. Set the GitHub "
+                "token with: aws secretsmanager put-secret-value --secret-id "
+                f"{GITHUB_TOKEN_SECRET_ARN} --secret-string <token>"
+            ) from error
+
         raw = secret["SecretString"].strip()
         try:
             parsed = json.loads(raw)

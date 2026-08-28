@@ -21,7 +21,7 @@ EventBridge (rate(1 day))
 
 * An AWS account with credentials that can create IAM roles, Lambda functions,
   ECR repositories, CodeCommit repositories and EventBridge rules.
-* Terraform >= 1.5.
+* Terraform >= 1.10, for the S3 backend's native locking.
 * Docker, to build the Lambda container image. The function needs the `git`
   binary, which is not in the zip runtimes, so it ships as an image. If you would
   rather build in CI, set `build_and_push_image = false` and pass `image_tag`.
@@ -34,17 +34,36 @@ EventBridge (rate(1 day))
 
 ## Deploy
 
+State lives in S3, so the bucket has to exist first. Once per account:
+
+```shell
+cd bootstrap
+terraform init
+terraform apply -var bucket_name=acme-terraform-state -var aws_region=eu-west-1
+terraform output -raw backend_hcl > ../backend.hcl
+cd ..
+```
+
+That creates a versioned, encrypted, private bucket and prints the backend
+configuration for it. Then the stack itself:
+
 ```shell
 cp terraform.tfvars.example terraform.tfvars
 $EDITOR terraform.tfvars
 
-terraform init
+terraform init -backend-config=backend.hcl
 terraform apply
 ```
 
-Terraform creates the secret but never holds the token: it writes a
-`REPLACE_ME` placeholder and ignores the value afterwards, so the real token
-stays out of the state file. Set it once, out of band:
+`backend.hcl` and `terraform.tfvars` are both gitignored. If you already have a
+state bucket, skip the bootstrap step and write `backend.hcl` by hand from
+[`backend.hcl.example`](backend.hcl.example).
+
+### Set the token
+
+Terraform creates the secret **empty** — it never holds the token, so the token
+never passes through Terraform and never lands in state. Write it once, out of
+band:
 
 ```shell
 aws secretsmanager put-secret-value \
@@ -52,9 +71,17 @@ aws secretsmanager put-secret-value \
   --secret-string 'ghp_yourtokenhere'
 ```
 
-The secret can be a bare token or JSON like `{"token": "ghp_..."}`.
+The value can be a bare token or JSON like `{"token": "ghp_..."}`. Until it is
+set, runs fail with a message telling you to run exactly this.
 
-Then run it without waiting for the schedule:
+Rotating later is the same command; the function picks the new value up on its
+next cold start.
+
+To point at a secret you already manage instead, set
+`create_github_token_secret = false` and
+`github_token_secret_arn = "arn:aws:secretsmanager:..."`.
+
+### Run it without waiting for the schedule
 
 ```shell
 aws lambda invoke \
@@ -64,8 +91,20 @@ aws lambda invoke \
 aws logs tail "$(terraform output -raw log_group_name)" --follow
 ```
 
-To point at an existing secret instead, set `create_github_token_secret = false`
-and `github_token_secret_arn = "arn:aws:secretsmanager:..."`.
+## State
+
+The backend is S3 with `use_lockfile = true`, which is Terraform's native S3
+locking — there is no DynamoDB table to create or pay for. That needs Terraform
+1.10 or newer, which is why `required_version` asks for it.
+
+The `bootstrap/` module keeps its own state locally rather than in the bucket it
+creates, because that would be circular. It creates one bucket; if you lose that
+state, `terraform import` recovers it, or you can simply leave the bucket alone.
+
+Nothing sensitive is in the mirror stack's state: the GitHub token is written
+directly to Secrets Manager and Terraform manages no secret version, so the
+value is never read into state. What is in there is ARNs, the ECR URL and the
+Lambda environment — owners, alert addresses, region.
 
 ## How the mirroring works
 
