@@ -2,11 +2,16 @@ data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
 locals {
-  # Every file that ends up in the image, so the tag changes when the code does.
+  # Every file that ends up in the image, plus the scripts that build it, so the
+  # tag changes when either the code or the way it is built changes. Without the
+  # scripts, a fix to the build would reuse the tag of the image it fixes and
+  # never rebuild.
   source_files = fileset("${path.module}/lambda", "**")
-  source_hash = sha1(join("", [
-    for file in sort(local.source_files) : filesha256("${path.module}/lambda/${file}")
-  ]))
+  build_files  = fileset("${path.module}/scripts", "*.sh")
+  source_hash = sha1(join("", concat(
+    [for file in sort(local.source_files) : filesha256("${path.module}/lambda/${file}")],
+    [for file in sort(local.build_files) : filesha256("${path.module}/scripts/${file}")],
+  )))
 
   image_tag = coalesce(var.image_tag, substr(local.source_hash, 0, 12))
   image_uri = "${aws_ecr_repository.lambda.repository_url}:${local.image_tag}"

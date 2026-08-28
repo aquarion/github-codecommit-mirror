@@ -263,6 +263,35 @@ that already succeeded, and the next scheduled run picks the work up anyway.
 * **A fresh clone every run** means bandwidth scales with total repository size,
   not with what changed. For very large estates, run it less often.
 
+## Troubleshooting
+
+**`InvalidParameterValueException: The image manifest, config or layer media
+type for the source image ... is not supported`** when Terraform creates or
+updates the function.
+
+Lambda only accepts Docker Image Manifest V2 Schema 2. BuildKit defaults to OCI
+media types and attaches provenance and SBOM attestations, which makes the tag
+an OCI *index* pointing at several manifests; Lambda cannot resolve that.
+[`scripts/build_image.sh`](scripts/build_image.sh) disables both attestations
+and pins `oci-mediatypes=false`, and
+[`scripts/build_and_push.sh`](scripts/build_and_push.sh) checks the media type
+in ECR after pushing, so a bad image fails the build with an explanation rather
+than at `CreateFunction`.
+
+This is not a size problem — Lambda allows images up to 10 GB and reports that
+separately — and Lambda layers are not an option for container-image functions;
+layers only attach to zip-packaged ones.
+
+If you hit it with an image built elsewhere, rebuild with:
+
+```shell
+docker buildx build --provenance=false --sbom=false \
+  --output "type=image,name=<image>,oci-mediatypes=false,push=true" ./lambda
+```
+
+The image tag is a hash of `lambda/` *and* `scripts/`, so changing how the image
+is built produces a new tag rather than reusing the broken one.
+
 ## Tests
 
 The Lambda's logic — repository naming, filters, pagination, ref pruning and

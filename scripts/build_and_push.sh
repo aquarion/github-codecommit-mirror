@@ -13,25 +13,55 @@ set -euo pipefail
 
 : "${AWS_REGION:?}" "${AWS_ACCOUNT_ID:?}" "${ECR_REPOSITORY:?}" "${IMAGE_TAG:?}" "${SOURCE_DIR:?}"
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 registry="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+repository="${ECR_REPOSITORY##*/}"
 image="${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-if aws ecr describe-images \
+# Lambda accepts nothing else. Checked after the push so a bad image fails here,
+# with an explanation, rather than inside CreateFunction.
+required_media_type="application/vnd.docker.distribution.manifest.v2+json"
+
+media_type_of() {
+  aws ecr describe-images \
     --region "${AWS_REGION}" \
-    --repository-name "${ECR_REPOSITORY##*/}" \
-    --image-ids "imageTag=${IMAGE_TAG}" >/dev/null 2>&1; then
-  echo "Image ${image} already exists, nothing to build."
-  exit 0
+    --repository-name "${repository}" \
+    --image-ids "imageTag=${IMAGE_TAG}" \
+    --query 'imageDetails[0].imageManifestMediaType' \
+    --output text 2>/dev/null
+}
+
+existing="$(media_type_of || true)"
+if [ -n "${existing}" ] && [ "${existing}" != "None" ]; then
+  if [ "${existing}" = "${required_media_type}" ]; then
+    echo "Image ${image} already exists, nothing to build."
+    exit 0
+  fi
+  echo "Image ${image} exists but is ${existing}; rebuilding." >&2
 fi
 
 echo "Logging in to ${registry}"
 aws ecr get-login-password --region "${AWS_REGION}" \
   | docker login --username AWS --password-stdin "${registry}"
 
-echo "Building ${image}"
-# The Lambda runtime is linux/amd64; build for it explicitly so this also works
-# from an Apple silicon workstation.
-docker build --platform linux/amd64 -t "${image}" "${SOURCE_DIR}"
+"${here}/build_image.sh" "${image}" "${SOURCE_DIR}"
 
-echo "Pushing ${image}"
-docker push "${image}"
+pushed="$(media_type_of || true)"
+if [ "${pushed}" != "${required_media_type}" ]; then
+  cat >&2 <<ERROR
+error: ${image} was pushed as
+         ${pushed}
+       but Lambda only supports
+         ${required_media_type}
+
+       Lambda would reject this with "The image manifest, config or layer media
+       type for the source image ... is not supported". This usually means the
+       build produced an OCI index, from BuildKit's provenance and SBOM
+       attestations or from the containerd image store. scripts/build_image.sh
+       disables both; check that your docker buildx supports --provenance and
+       that the docker-container builder started.
+ERROR
+  exit 1
+fi
+
+echo "Pushed ${image} (${pushed})"
