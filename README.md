@@ -17,14 +17,6 @@ EventBridge (rate(1 day))
    CodeCommit (one private repository per GitHub repository)
 ```
 
-## A note on CodeCommit's availability
-
-AWS closed CodeCommit to new customers in July 2024, and a lot of writing from
-that period still says the service is a dead end. That changed: CodeCommit
-[returned to general availability on 24 November 2025](https://aws.amazon.com/blogs/devops/aws-codecommit-returns-to-general-availability/).
-New accounts can create repositories again, and AWS has committed to continued
-support and regional expansion.
-
 ## What you need
 
 * An AWS account with credentials that can create IAM roles, Lambda functions,
