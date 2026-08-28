@@ -213,8 +213,42 @@ variable "schedule_enabled" {
   default     = true
 }
 
+variable "alert_email_to" {
+  description = <<-EOT
+    Email addresses to notify when a run fails. Leave empty to disable email
+    alerting. Setting this requires alert_email_from.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "alert_email_from" {
+  description = <<-EOT
+    From address for failure emails. Its domain (or the address itself) must
+    already be a verified SES identity in ses_region, and if that SES account is
+    still in the sandbox the recipients must be verified too.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.alert_email_from == null || can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email_from))
+    error_message = "alert_email_from must be an email address."
+  }
+}
+
+variable "ses_region" {
+  description = "Region holding the verified SES identity. Defaults to aws_region."
+  type        = string
+  default     = null
+}
+
 variable "alarm_sns_topic_arn" {
-  description = "Optional SNS topic notified when a run fails. Also used as the Lambda on-failure destination."
+  description = <<-EOT
+    Existing SNS topic for the CloudWatch alarms and the Lambda on-failure
+    destination. Leave null and set alert_email_to to have this stack create a
+    topic and subscribe those addresses instead.
+  EOT
   type        = string
   default     = null
 }

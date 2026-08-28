@@ -89,13 +89,38 @@ data "aws_iam_policy_document" "lambda" {
     resources = [aws_lambda_function.mirror.arn]
   }
 
+  # For the Lambda on-failure destination.
   dynamic "statement" {
-    for_each = var.alarm_sns_topic_arn == null ? [] : [var.alarm_sns_topic_arn]
+    for_each = local.alerting_enabled ? [1] : []
 
     content {
       sid       = "PublishFailures"
       actions   = ["sns:Publish"]
-      resources = [statement.value]
+      resources = [local.alarm_topic_arn]
+    }
+  }
+
+  # Failure alert emails. Scoped to the verified identity and the one From
+  # address, so this role cannot send as anything else.
+  dynamic "statement" {
+    # The from address is also required by a precondition; guarding here keeps
+    # a misconfiguration reporting that message rather than an interpolation error.
+    for_each = local.email_alerts_enabled && var.alert_email_from != null ? [1] : []
+
+    content {
+      sid     = "SendFailureAlerts"
+      actions = ["ses:SendEmail"]
+
+      resources = [
+        "arn:${data.aws_partition.current.partition}:ses:${local.ses_region}:${data.aws_caller_identity.current.account_id}:identity/${local.ses_from_domain}",
+        "arn:${data.aws_partition.current.partition}:ses:${local.ses_region}:${data.aws_caller_identity.current.account_id}:identity/${var.alert_email_from}",
+      ]
+
+      condition {
+        test     = "StringEquals"
+        variable = "ses:FromAddress"
+        values   = [var.alert_email_from]
+      }
     }
   }
 }

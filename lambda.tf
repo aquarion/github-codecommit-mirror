@@ -37,6 +37,9 @@ resource "aws_lambda_function" "mirror" {
       MAX_CONTINUATIONS       = tostring(var.max_continuations)
       METRIC_NAMESPACE        = var.name
       LOG_LEVEL               = var.log_level
+      ALERT_EMAIL_TO          = join(",", var.alert_email_to)
+      ALERT_EMAIL_FROM        = var.alert_email_from == null ? "" : var.alert_email_from
+      SES_REGION              = local.ses_region
     }
   }
 
@@ -54,11 +57,11 @@ resource "aws_lambda_function_event_invoke_config" "mirror" {
   maximum_retry_attempts = 0
 
   dynamic "destination_config" {
-    for_each = var.alarm_sns_topic_arn == null ? [] : [var.alarm_sns_topic_arn]
+    for_each = local.alerting_enabled ? [1] : []
 
     content {
       on_failure {
-        destination = destination_config.value
+        destination = local.alarm_topic_arn
       }
     }
   }

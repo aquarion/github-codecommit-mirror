@@ -157,10 +157,48 @@ knowing about:
 | `lambda_memory_mb` | `3008` | More memory means more CPU and network, which is what makes git faster. |
 | `lambda_ephemeral_storage_mb` | `10240` | Size of `/tmp`; must exceed your largest repository. |
 | `max_repo_size_mb` | `4096` | Larger repositories are skipped and logged. |
-| `alarm_sns_topic_arn` | none | Enables failure alarms and an on-failure destination. |
+| `alert_email_to` | `[]` | Addresses emailed when a run fails. Empty disables alerting entirely. |
+| `alert_email_from` | none | Verified SES sender. Required when `alert_email_to` is set. |
+| `ses_region` | `aws_region` | Region holding the verified SES identity. |
+| `alarm_sns_topic_arn` | none | Route alarms to a topic you already manage instead of one created here. |
 
 For GitHub Enterprise Server, set `github_api_url` to
 `https://ghe.example.com/api/v3`; the clone host is derived from it.
+
+## Failure alerts
+
+Set two variables and every failure arrives as an email:
+
+```hcl
+alert_email_to   = ["ops@example.com"]
+alert_email_from = "mirror@example.com" # a verified SES identity
+```
+
+Two things report, because they catch different failures:
+
+* **The function emails you directly, via SES.** Any error that reaches the
+  handler — a repository that would not clone, an expired token, GitHub
+  unreachable — sends a mail naming the repositories that failed, the counts for
+  the run, and the log group, stream and request id to look at. The message is
+  scrubbed of the token first, and a mail that cannot be sent is logged and
+  swallowed so it never masks the failure it was reporting.
+* **CloudWatch alarms cover what the function cannot report itself.** A timeout,
+  an out-of-memory kill or a crash before the error path runs leaves nothing to
+  send the mail. The alarms on Lambda `Errors` and on this stack's own `Failed`
+  metric catch those. With `alert_email_to` set and no `alarm_sns_topic_arn`,
+  the stack creates an SNS topic and subscribes those addresses; **AWS emails
+  each one a confirmation link that has to be clicked** before anything is
+  delivered. Supply `alarm_sns_topic_arn` instead to route alarms into a topic
+  you already manage, and this stack leaves its subscriptions alone.
+
+The from address needs its domain (or the address itself) verified as an SES
+identity in `ses_region`, which defaults to `aws_region`. If that SES account is
+still in the sandbox, the recipients have to be verified too. The Lambda's IAM
+policy is scoped to that identity with a `ses:FromAddress` condition, so the
+role cannot send as anything else.
+
+Leave `alert_email_to` empty and no alarms, topic or SES permissions are created
+at all.
 
 ## Monitoring
 
@@ -172,8 +210,6 @@ which surfaces as a Lambda `Errors` data point.
 
 Failed runs are never retried automatically. A retry would re-clone everything
 that already succeeded, and the next scheduled run picks the work up anyway.
-
-Set `alarm_sns_topic_arn` to get alarms on both signals.
 
 ## Limits worth knowing
 

@@ -21,5 +21,11 @@ codecommit_name_prefix = "gh-"
 # Daily at 03:00 UTC.
 schedule_expression = "cron(0 3 * * ? *)"
 
-# Optional: get told when a run fails.
+# Get told when a run fails. alert_email_from must be a verified SES identity;
+# the SNS subscription AWS creates for the alarms needs confirming by email once.
+alert_email_to   = ["ops@example.com"]
+alert_email_from = "mirror@example.com"
+# ses_region = "eu-west-1"
+
+# Or route the alarms into a topic you already manage:
 # alarm_sns_topic_arn = "arn:aws:sns:eu-west-1:123456789012:alerts"

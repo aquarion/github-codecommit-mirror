@@ -436,3 +436,156 @@ class TestListingAcrossOwners:
         assert handler.codecommit_name("octocat/api") != handler.codecommit_name(
             "acme/api"
         )
+
+
+class FakeContext:
+    aws_request_id = "req-123"
+    log_group_name = "/aws/lambda/mirror"
+    log_stream_name = "2026/08/28/[$LATEST]abc"
+
+    def __init__(self, remaining_ms=900_000):
+        self._remaining = remaining_ms
+
+    def get_remaining_time_in_millis(self):
+        return self._remaining
+
+
+class TestFailureEmail:
+    def test_names_the_repositories_that_failed(self):
+        report = {"counts": {"mirrored": 3, "failed": 2}, "failures": ["o/a", "o/b"]}
+
+        subject, body = handler._failure_email(
+            RuntimeError("2 repositories failed to mirror"), report, FakeContext()
+        )
+
+        assert subject == "GitHub mirror: 2 repositories failed"
+        assert "o/a" in body and "o/b" in body
+        assert "mirrored: 3" in body
+
+    def test_reports_a_run_that_died_before_any_repository(self):
+        subject, body = handler._failure_email(
+            RuntimeError("boom"), {"counts": {}, "failures": []}, FakeContext()
+        )
+
+        assert subject == "GitHub mirror: run failed"
+        assert "boom" in body
+
+    def test_includes_where_to_find_the_logs(self):
+        _, body = handler._failure_email(
+            RuntimeError("boom"), {"counts": {}, "failures": []}, FakeContext()
+        )
+
+        assert "/aws/lambda/mirror" in body
+        assert "req-123" in body
+
+    def test_truncates_a_very_long_failure_list(self):
+        failures = [f"o/repo{n}" for n in range(70)]
+        _, body = handler._failure_email(
+            RuntimeError("boom"), {"counts": {}, "failures": failures}, FakeContext()
+        )
+
+        assert "...and 20 more" in body
+        assert "o/repo69" not in body
+
+    def test_never_carries_the_token(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", "ghp_supersecret")
+
+        _, body = handler._failure_email(
+            RuntimeError("failed: https://ghp_supersecret@github.com/o/r"),
+            {"counts": {}, "failures": []},
+            FakeContext(),
+        )
+
+        assert "ghp_supersecret" not in body
+
+
+class TestFailureAlerting:
+    def test_sends_to_the_configured_recipients(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(handler, "ALERT_EMAIL_TO", ["ops@example.com"])
+        monkeypatch.setattr(handler, "ALERT_EMAIL_FROM", "mirror@example.com")
+        monkeypatch.setattr(
+            handler, "_ses", lambda: type("S", (), {"send_email": lambda _self=None, **kw: sent.update(kw)})()
+        )
+
+        handler._email_failure(RuntimeError("boom"), {"counts": {}, "failures": []}, None)
+
+        assert sent["FromEmailAddress"] == "mirror@example.com"
+        assert sent["Destination"]["ToAddresses"] == ["ops@example.com"]
+
+    def test_stays_quiet_when_no_recipients_are_configured(self, monkeypatch):
+        monkeypatch.setattr(handler, "ALERT_EMAIL_TO", [])
+        monkeypatch.setattr(
+            handler, "_ses", lambda: pytest.fail("should not build an SES client")
+        )
+
+        handler._email_failure(RuntimeError("boom"), {}, None)
+
+    def test_a_broken_mailbox_does_not_hide_the_run_failure(self, monkeypatch):
+        monkeypatch.setattr(handler, "ALERT_EMAIL_TO", ["ops@example.com"])
+        monkeypatch.setattr(handler, "ALERT_EMAIL_FROM", "mirror@example.com")
+
+        def exploding():
+            raise RuntimeError("SES is down")
+
+        monkeypatch.setattr(handler, "_ses", exploding)
+
+        # Must return rather than propagate: the caller re-raises the real error.
+        handler._email_failure(RuntimeError("boom"), {}, None)
+
+    def test_the_handler_emails_then_re_raises(self, monkeypatch):
+        alerts = []
+        monkeypatch.setattr(
+            handler, "_email_failure", lambda error, report, ctx: alerts.append(error)
+        )
+        monkeypatch.setattr(handler, "github_token", lambda: "ghp_token")
+        monkeypatch.setattr(handler, "configure_git", lambda token: None)
+        monkeypatch.setattr(
+            handler, "list_github_repositories", lambda token: (_ for _ in ()).throw(
+                RuntimeError("GitHub is unreachable")
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="GitHub is unreachable"):
+            handler.lambda_handler({}, FakeContext())
+
+        assert len(alerts) == 1
+
+    def test_a_failed_repository_reaches_the_email_with_its_name(self, monkeypatch):
+        alerts = []
+        monkeypatch.setattr(
+            handler, "_email_failure", lambda error, report, ctx: alerts.append(report)
+        )
+        monkeypatch.setattr(handler, "github_token", lambda: "ghp_token")
+        monkeypatch.setattr(handler, "configure_git", lambda token: None)
+        monkeypatch.setattr(handler, "_publish_metrics", lambda counts: None)
+        monkeypatch.setattr(
+            handler,
+            "mirror_repository",
+            lambda repo: (_ for _ in ()).throw(handler.MirrorError("clone failed")),
+        )
+
+        with pytest.raises(RuntimeError):
+            handler.lambda_handler(
+                {"pending": [{"full_name": "octocat/broken", "clone_url": "x"}]},
+                FakeContext(),
+            )
+
+        assert alerts[0]["failures"] == ["octocat/broken"]
+        assert alerts[0]["counts"]["failed"] == 1
+
+    def test_a_clean_run_sends_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            handler, "_email_failure", lambda *a: pytest.fail("should not alert")
+        )
+        monkeypatch.setattr(handler, "github_token", lambda: "ghp_token")
+        monkeypatch.setattr(handler, "configure_git", lambda token: None)
+        monkeypatch.setattr(handler, "_publish_metrics", lambda counts: None)
+        monkeypatch.setattr(handler, "mirror_repository", lambda repo: "mirrored")
+
+        summary = handler.lambda_handler(
+            {"pending": [{"full_name": "octocat/fine", "clone_url": "x"}]},
+            FakeContext(),
+        )
+
+        assert summary["mirrored"] == 1

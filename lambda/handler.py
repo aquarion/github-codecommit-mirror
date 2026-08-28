@@ -49,6 +49,14 @@ TIME_BUDGET_SECONDS = int(os.environ.get("TIME_BUDGET_SECONDS", "180"))
 MAX_CONTINUATIONS = int(os.environ.get("MAX_CONTINUATIONS", "10"))
 METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "GitHubCodeCommitMirror")
 
+ALERT_EMAIL_TO = [
+    address.strip()
+    for address in os.environ.get("ALERT_EMAIL_TO", "").split(",")
+    if address.strip()
+]
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM") or None
+SES_REGION = os.environ.get("SES_REGION") or os.environ["AWS_REGION"]
+
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/mirror")
 GIT_CREDENTIALS_FILE = "/tmp/.git-credentials"
 
@@ -89,6 +97,8 @@ lambda_client = boto3.client("lambda")
 
 _token_cache: str | None = None
 _viewer_cache: str | None = None
+# Only built when a run actually fails, so a healthy run pays nothing for it.
+_ses_client = None
 
 
 # --------------------------------------------------------------------------
@@ -423,6 +433,18 @@ def prune_refs(workdir: str) -> None:
 # Handler
 # --------------------------------------------------------------------------
 def lambda_handler(event, context):
+    """Entry point. Every way this can fail ends in an alert email."""
+    report = {"counts": {}, "failures": []}
+    try:
+        return _run(event, context, report)
+    except Exception as error:
+        # The email must never replace the real failure: log it, send what we
+        # can, then re-raise so Lambda still records the invocation as failed.
+        _email_failure(error, report, context)
+        raise
+
+
+def _run(event, context, report: dict):
     event = event if isinstance(event, dict) else {}
     continuation = int(event.get("continuation", 0))
 
@@ -436,6 +458,8 @@ def lambda_handler(event, context):
     counts = {"mirrored": 0, "empty": 0, "skipped": 0, "failed": 0}
     failures: list[str] = []
     remaining: list[dict] = []
+    report["counts"] = counts
+    report["failures"] = failures
 
     for index, repo in enumerate(pending):
         if _out_of_time(context) and index > 0:
@@ -484,6 +508,73 @@ def _continue(context, remaining: list[dict], continuation: int) -> None:
         InvocationType="Event",
         Payload=json.dumps({"pending": remaining, "continuation": continuation + 1}).encode(),
     )
+
+
+def _ses():
+    global _ses_client
+    if _ses_client is None:
+        _ses_client = boto3.client("sesv2", region_name=SES_REGION)
+    return _ses_client
+
+
+def _failure_email(error: Exception, report: dict, context) -> tuple[str, str]:
+    """Subject and body for the alert. Never includes the GitHub token."""
+    counts = report.get("counts") or {}
+    failures = report.get("failures") or []
+
+    if failures:
+        subject = f"GitHub mirror: {len(failures)} repositories failed"
+    else:
+        # Listing GitHub failed, credentials are wrong, the run timed out --
+        # something that stopped the run before individual repositories.
+        subject = "GitHub mirror: run failed"
+
+    lines = [subject, "", f"Error: {_scrub(str(error)) or error.__class__.__name__}", ""]
+
+    if counts:
+        lines += [
+            "Counts:",
+            *(f"  {name}: {value}" for name, value in counts.items()),
+            "",
+        ]
+
+    if failures:
+        lines += ["Repositories that failed:"]
+        lines += [f"  {name}" for name in failures[:50]]
+        if len(failures) > 50:
+            lines.append(f"  ...and {len(failures) - 50} more")
+        lines.append("")
+
+    if context is not None:
+        lines += [
+            "Logs:",
+            f"  group:   {getattr(context, 'log_group_name', '?')}",
+            f"  stream:  {getattr(context, 'log_stream_name', '?')}",
+            f"  request: {getattr(context, 'aws_request_id', '?')}",
+        ]
+
+    return subject, "\n".join(lines)
+
+
+def _email_failure(error: Exception, report: dict, context) -> None:
+    if not ALERT_EMAIL_TO or not ALERT_EMAIL_FROM:
+        return
+
+    subject, body = _failure_email(error, report, context)
+    try:
+        _ses().send_email(
+            FromEmailAddress=ALERT_EMAIL_FROM,
+            Destination={"ToAddresses": ALERT_EMAIL_TO},
+            Content={
+                "Simple": {
+                    "Subject": {"Data": subject, "Charset": "UTF-8"},
+                    "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+                }
+            },
+        )
+        LOG.info("Sent failure alert to %s recipients", len(ALERT_EMAIL_TO))
+    except Exception:  # noqa: BLE001 - a broken mailbox must not hide the run failure
+        LOG.exception("Could not send the failure alert email")
 
 
 def _publish_metrics(counts: dict) -> None:
