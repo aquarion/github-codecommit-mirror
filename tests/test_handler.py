@@ -1,0 +1,277 @@
+import importlib
+
+import pytest
+
+handler = importlib.import_module("handler")
+
+
+class TestCodeCommitName:
+    def test_maps_owner_and_repo_with_the_prefix(self):
+        assert handler.codecommit_name("octocat/hello-world") == "gh-octocat-hello-world"
+
+    def test_replaces_characters_codecommit_rejects(self):
+        assert handler.codecommit_name("octo cat/hello+world") == "gh-octo-cat-hello-world"
+
+    def test_truncates_long_names_but_keeps_them_unique(self):
+        long_one = "octocat/" + "a" * 200
+        long_two = "octocat/" + "a" * 201
+
+        first = handler.codecommit_name(long_one)
+        second = handler.codecommit_name(long_two)
+
+        assert len(first) <= 100
+        assert first != second
+
+    def test_names_stay_within_the_character_set_codecommit_allows(self):
+        import re
+
+        name = handler.codecommit_name("Some.Org/weird~name!")
+        assert re.fullmatch(r"[A-Za-z0-9._-]{1,100}", name)
+
+
+class TestRepositoryFilters:
+    def repo(self, **overrides):
+        base = {
+            "full_name": "octocat/hello-world",
+            "owner": {"login": "octocat"},
+            "fork": False,
+            "archived": False,
+            "private": False,
+        }
+        base.update(overrides)
+        return base
+
+    def test_keeps_a_plain_repository(self):
+        assert handler._wanted(self.repo())
+
+    def test_drops_repositories_owned_by_someone_else(self):
+        assert not handler._wanted(
+            self.repo(full_name="other/thing", owner={"login": "other"})
+        )
+
+    def test_owner_comparison_ignores_case(self):
+        assert handler._wanted(self.repo(owner={"login": "OctoCat"}))
+
+    def test_drops_forks_and_archived_repositories_by_default(self):
+        assert not handler._wanted(self.repo(fork=True))
+        assert not handler._wanted(self.repo(archived=True))
+
+    def test_keeps_forks_when_configured(self, monkeypatch):
+        monkeypatch.setattr(handler, "INCLUDE_FORKS", True)
+        assert handler._wanted(self.repo(fork=True))
+
+    @pytest.mark.parametrize(
+        "visibility,private,expected",
+        [
+            ("all", True, True),
+            ("all", False, True),
+            ("private", True, True),
+            ("private", False, False),
+            ("public", True, False),
+            ("public", False, True),
+        ],
+    )
+    def test_visibility_filter(self, monkeypatch, visibility, private, expected):
+        monkeypatch.setattr(handler, "VISIBILITY", visibility)
+        assert handler._wanted(self.repo(private=private)) is expected
+
+    def test_include_and_exclude_patterns(self, monkeypatch):
+        monkeypatch.setattr(handler, "INCLUDE_PATTERN", r"hello")
+        assert handler._wanted(self.repo())
+        assert not handler._wanted(self.repo(full_name="octocat/goodbye"))
+
+        monkeypatch.setattr(handler, "INCLUDE_PATTERN", None)
+        monkeypatch.setattr(handler, "EXCLUDE_PATTERN", r"^octocat/hello")
+        assert not handler._wanted(self.repo())
+
+
+class TestPagination:
+    def test_finds_the_next_page(self):
+        link = (
+            '<https://api.github.com/user/repos?page=2>; rel="next", '
+            '<https://api.github.com/user/repos?page=9>; rel="last"'
+        )
+        assert handler._next_link(link) == "https://api.github.com/user/repos?page=2"
+
+    def test_returns_none_on_the_last_page(self):
+        link = '<https://api.github.com/user/repos?page=8>; rel="prev"'
+        assert handler._next_link(link) is None
+
+    def test_returns_none_without_a_link_header(self):
+        assert handler._next_link("") is None
+
+
+class TestSecretScrubbing:
+    def test_removes_the_token_from_git_output(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", "ghp_supersecret")
+        message = "fatal: could not read from https://ghp_supersecret@github.com/o/r"
+
+        scrubbed = handler._scrub(message)
+
+        assert "ghp_supersecret" not in scrubbed
+        assert "***" in scrubbed
+
+    def test_redacts_credentials_embedded_in_a_url(self):
+        assert handler._redact_url("https://user:pass@github.com/o/r") == (
+            "https://***@github.com/o/r"
+        )
+
+
+class TestTokenParsing:
+    def test_accepts_a_plain_string_secret(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", None)
+        monkeypatch.setattr(
+            handler.secretsmanager,
+            "get_secret_value",
+            lambda **_: {"SecretString": "  ghp_plain  "},
+        )
+        assert handler.github_token() == "ghp_plain"
+
+    def test_accepts_a_json_secret(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", None)
+        monkeypatch.setattr(
+            handler.secretsmanager,
+            "get_secret_value",
+            lambda **_: {"SecretString": '{"token": "ghp_json"}'},
+        )
+        assert handler.github_token() == "ghp_json"
+
+    def test_rejects_a_json_secret_without_a_token_key(self, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", None)
+        monkeypatch.setattr(
+            handler.secretsmanager,
+            "get_secret_value",
+            lambda **_: {"SecretString": '{"username": "octocat"}'},
+        )
+        with pytest.raises(ValueError, match="no 'token' key"):
+            handler.github_token()
+
+
+class TestRetryDelay:
+    def make_error(self, code, headers):
+        import urllib.error
+
+        return urllib.error.HTTPError("https://api.github.com", code, "", headers, None)
+
+    def test_honours_retry_after(self):
+        error = self.make_error(429, {"Retry-After": "12"})
+        assert handler._retry_delay(error, 1) == 12
+
+    def test_caps_the_wait_so_the_lambda_does_not_time_out(self):
+        error = self.make_error(429, {"Retry-After": "3600"})
+        assert handler._retry_delay(error, 1) == 60
+
+    def test_waits_for_the_rate_limit_reset(self, monkeypatch):
+        monkeypatch.setattr(handler.time, "time", lambda: 1_000)
+        error = self.make_error(
+            403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1030"}
+        )
+        assert handler._retry_delay(error, 1) == 30
+
+    def test_falls_back_to_exponential_backoff(self):
+        error = self.make_error(500, {})
+        assert handler._retry_delay(error, 3) == 8
+
+
+class TestPruneRefs:
+    """Uses a real repository on disk, because the point is the git behaviour."""
+
+    def make_mirror(self, tmp_path):
+        import subprocess
+
+        source = tmp_path / "source"
+        source.mkdir()
+        run = lambda *args: subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True
+        )
+        run("init", "--quiet", "--initial-branch=main")
+        run("config", "user.email", "test@example.com")
+        run("config", "user.name", "test")
+        (source / "file.txt").write_text("hello\n")
+        run("add", "file.txt")
+        run("commit", "--quiet", "-m", "initial")
+        run("tag", "v1.0.0")
+
+        mirror = tmp_path / "mirror.git"
+        subprocess.run(
+            ["git", "clone", "--mirror", "--quiet", str(source), str(mirror)],
+            check=True,
+            capture_output=True,
+        )
+        # GitHub advertises refs a mirror clone happily copies but CodeCommit
+        # rejects, so fake one here.
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=source, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-ref", "refs/pull/42/head", head],
+            cwd=mirror, check=True, capture_output=True,
+        )
+        return mirror
+
+    def refs(self, mirror):
+        return set(
+            handler.git(["for-each-ref", "--format=%(refname)"], cwd=str(mirror)).split()
+        )
+
+    def test_drops_pull_refs_and_keeps_branches_and_tags(self, tmp_path):
+        mirror = self.make_mirror(tmp_path)
+        assert "refs/pull/42/head" in self.refs(mirror)
+
+        handler.prune_refs(str(mirror))
+
+        assert self.refs(mirror) == {"refs/heads/main", "refs/tags/v1.0.0"}
+
+    def test_is_a_no_op_when_there_is_nothing_to_drop(self, tmp_path):
+        mirror = self.make_mirror(tmp_path)
+        handler.prune_refs(str(mirror))
+        before = self.refs(mirror)
+
+        handler.prune_refs(str(mirror))
+
+        assert self.refs(mirror) == before
+
+
+class TestGitFailures:
+    def test_raises_a_mirror_error_without_leaking_the_token(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(handler, "_token_cache", "ghp_supersecret")
+
+        with pytest.raises(handler.MirrorError) as failure:
+            handler.git(["clone", "https://ghp_supersecret@example.invalid/o/r.git",
+                         str(tmp_path / "out")])
+
+        assert "ghp_supersecret" not in str(failure.value)
+
+
+class TestConfigureGit:
+    def test_stores_a_credential_git_will_actually_match(self, tmp_path, monkeypatch):
+        credentials = tmp_path / ".git-credentials"
+        monkeypatch.setattr(handler, "GIT_CREDENTIALS_FILE", str(credentials))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / ".gitconfig"))
+
+        handler.configure_git("ghp_token")
+
+        # git only reuses a stored credential when the username matches the one
+        # it asks for, so the entry has to be user:password, not password alone.
+        assert credentials.read_text() == "https://x-access-token:ghp_token@github.com\n"
+        assert oct(credentials.stat().st_mode)[-3:] == "600"
+
+    def test_percent_encodes_awkward_characters(self, tmp_path, monkeypatch):
+        credentials = tmp_path / ".git-credentials"
+        monkeypatch.setattr(handler, "GIT_CREDENTIALS_FILE", str(credentials))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / ".gitconfig"))
+
+        handler.configure_git("tok/en@with:chars")
+
+        assert "tok%2Fen%40with%3Achars" in credentials.read_text()
+
+    def test_derives_the_clone_host_from_the_api_url(self, tmp_path, monkeypatch):
+        credentials = tmp_path / ".git-credentials"
+        monkeypatch.setattr(handler, "GIT_CREDENTIALS_FILE", str(credentials))
+        monkeypatch.setattr(handler, "GITHUB_API_URL", "https://ghe.example.com/api/v3")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / ".gitconfig"))
+
+        handler.configure_git("ghp_token")
+
+        assert credentials.read_text().endswith("@ghe.example.com\n")
