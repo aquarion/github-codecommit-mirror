@@ -1,4 +1,6 @@
-# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+# Real, committed configuration for this deployment. See README.md's Deploy
+# section. terraform.tfvars.example is the template for a second, independent
+# deployment of this stack.
 
 aws_region = "eu-west-1"
 
