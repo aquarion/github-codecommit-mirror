@@ -1050,16 +1050,25 @@ class TestMirrorRepository:
     def test_realigns_the_default_branch_before_pushing(self, monkeypatch, tmp_path):
         repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path))
         repo["default_branch"] = "main"
-        pushes = self.intercept_push(monkeypatch)
-        calls = []
+        order = []
+        real_git = handler.git
+
+        def fake_git(args, cwd=None, timeout=900, stdin=None):
+            if args and args[0] == "push":
+                order.append("push")
+                return ""
+            return real_git(args, cwd=cwd, timeout=timeout, stdin=stdin)
+
+        monkeypatch.setattr(handler, "git", fake_git)
         monkeypatch.setattr(
-            handler, "realign_default_branch", lambda *a: calls.append(a)
+            handler,
+            "realign_default_branch",
+            lambda *a: order.append(("realign", *a)),
         )
 
         assert handler.mirror_repository(repo) == "mirrored"
 
-        assert calls == [("gh-octocat-thing", "main")]
-        assert calls[0][0] and pushes, "realignment must happen before the push"
+        assert order == [("realign", "gh-octocat-thing", "main"), "push"]
 
     def test_an_empty_repository_is_never_realigned(self, monkeypatch, tmp_path):
         repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path, empty=True))
