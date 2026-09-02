@@ -61,6 +61,9 @@ resource "aws_iam_role" "github_actions_deploy" {
   assume_role_policy = data.aws_iam_policy_document.github_actions_assume_role.json
 }
 
+# No CodeCommit permissions here: this stack never manages CodeCommit
+# repositories via Terraform. The Lambda's own execution role creates them
+# at runtime, so the deploy role needs none.
 data "aws_iam_policy_document" "github_actions_deploy" {
   statement {
     sid       = "TerraformState"
@@ -93,6 +96,8 @@ data "aws_iam_policy_document" "github_actions_deploy" {
     actions   = ["iam:PassRole"]
     resources = [local.mirror_lambda_role_arn]
 
+    # Scoped so this role can only be passed to Lambda, not any other AWS
+    # service.
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"
@@ -127,10 +132,17 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "logs:DeleteLogGroup",
       "logs:PutRetentionPolicy",
       "logs:TagResource",
-      "logs:DescribeLogGroups",
       "logs:ListTagsForResource",
     ]
     resources = [local.mirror_log_group_arn]
+  }
+
+  # No resource-level support: DescribeLogGroups is a list action and does
+  # not accept a specific log-group ARN in all cases.
+  statement {
+    sid       = "LogsDescribe"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
   }
 
   statement {
@@ -210,7 +222,7 @@ data "aws_iam_policy_document" "github_actions_deploy" {
   }
 
   statement {
-    sid = "GithubTokenSecretShell"
+    sid = "GitHubTokenSecret"
     actions = [
       "secretsmanager:CreateSecret",
       "secretsmanager:DescribeSecret",
