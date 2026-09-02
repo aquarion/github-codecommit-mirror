@@ -57,3 +57,29 @@ jobs:
       # Not pushed anywhere: this only proves the image still builds.
       - name: Build
         run: docker build --platform linux/amd64 -t github-codecommit-mirror:ci lambda
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [terraform, tests, image]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.3
+
+      - name: Init
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Apply
+        run: terraform apply -auto-approve
