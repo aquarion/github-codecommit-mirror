@@ -13,3 +13,8 @@ output "backend_hcl" {
     use_lockfile = true
   EOT
 }
+
+output "github_actions_role_arn" {
+  description = "Role for GitHub Actions to assume via OIDC. Set as the AWS_DEPLOY_ROLE_ARN repository variable."
+  value       = aws_iam_role.github_actions_deploy.arn
+}

@@ -1,5 +1,5 @@
 # Copy to backend.hcl and edit, then: terraform init -backend-config=backend.hcl
-# backend.hcl is gitignored; it holds no secrets, only account-specific names.
+# It holds no secrets, only account-specific names.
 
 bucket = "REPLACE-WITH-YOUR-STATE-BUCKET"
 key    = "github-codecommit-mirror/terraform.tfstate"

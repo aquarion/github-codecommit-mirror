@@ -57,3 +57,33 @@ jobs:
       # Not pushed anywhere: this only proves the image still builds.
       - name: Build
         run: docker build --platform linux/amd64 -t github-codecommit-mirror:ci lambda
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [terraform, tests, image]
+    # Only deploy once a push has actually landed on main - not on pull requests.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Requires the AWS_DEPLOY_ROLE_ARN repository variable, set once from the
+      # bootstrap module's github_actions_role_arn output.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          # Must match var.aws_region's default in variables.tf and the region in backend.hcl.
+          aws-region: eu-west-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.3
+
+      - name: Init
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      - name: Apply
+        run: terraform apply -input=false -auto-approve

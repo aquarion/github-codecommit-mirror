@@ -1,4 +1,6 @@
-# Copy to terraform.tfvars and edit, if setting up a second deployment of this stack.
+# Real, committed configuration for this deployment. See README.md's Deploy
+# section. terraform.tfvars.example is the template for a second, independent
+# deployment of this stack.
 
 aws_region = "eu-west-1"
 
@@ -6,12 +8,12 @@ aws_region = "eu-west-1"
 # organisations can share one deployment, as long as one token reaches them all.
 github_owners = [
   { name = "aquarion", type = "user" },
-  # { name = "my-org", type = "org" },
+  { name = "istic", type = "org" },
 ]
 
 # What to mirror. The defaults skip forks and archived repositories.
 visibility       = "all"
-include_forks    = false
+include_forks    = true
 include_archived = false
 # exclude_pattern = "^aquarion/(scratch|sandbox)-"
 
@@ -19,12 +21,12 @@ include_archived = false
 codecommit_name_prefix = "gh-"
 
 # Daily at 03:00 UTC.
-schedule_expression = "cron(0 3 * * ? *)"
+schedule_expression = "cron(0 4 * * ? *)"
 
 # Get told when a run fails. alert_email_from must be a verified SES identity;
 # the SNS subscription AWS creates for the alarms needs confirming by email once.
-alert_email_to   = ["ops@example.com"]
-alert_email_from = "mirror@example.com"
+alert_email_to   = ["nicholas+codecommitmirror@aquarionics.com"]
+alert_email_from = "codecommitmirror@aquarionics.com"
 # ses_region = "eu-west-1"
 
 # Or route the alarms into a topic you already manage:

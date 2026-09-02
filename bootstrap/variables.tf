@@ -29,3 +29,41 @@ variable "tags" {
     Project   = "github-codecommit-mirror"
   }
 }
+
+variable "github_repository" {
+  description = "GitHub repository allowed to deploy via OIDC, as 'owner/repo'."
+  type        = string
+  default     = "aquarion/github-codecommit-mirror"
+
+  validation {
+    condition     = can(regex("^[^/]+/[^/]+$", var.github_repository))
+    error_message = "github_repository must be in 'owner/repo' form."
+  }
+}
+
+variable "mirror_stack_name" {
+  description = <<-EOT
+    Must match `name` in the parent module (default
+    "github-codecommit-mirror"). Scopes the deploy role's permissions to the
+    resources that stack creates.
+  EOT
+  type        = string
+  default     = "github-codecommit-mirror"
+}
+
+variable "create_oidc_provider" {
+  description = <<-EOT
+    Whether to create the GitHub Actions OIDC provider. AWS allows only one
+    provider per URL per account - set this to false and provide
+    oidc_provider_arn if the account already has one (e.g. from another
+    repository's deploy setup).
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "oidc_provider_arn" {
+  description = "ARN of an existing GitHub Actions OIDC provider. Required when create_oidc_provider is false."
+  type        = string
+  default     = null
+}
