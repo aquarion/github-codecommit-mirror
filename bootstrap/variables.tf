@@ -34,6 +34,11 @@ variable "github_repository" {
   description = "GitHub repository allowed to deploy via OIDC, as 'owner/repo'."
   type        = string
   default     = "aquarion/github-codecommit-mirror"
+
+  validation {
+    condition     = can(regex("^[^/]+/[^/]+$", var.github_repository))
+    error_message = "github_repository must be in 'owner/repo' form."
+  }
 }
 
 variable "mirror_stack_name" {
