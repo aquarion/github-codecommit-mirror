@@ -1,4 +1,4 @@
-# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+# Copy to terraform.tfvars and edit, if setting up a second deployment of this stack.
 
 aws_region = "eu-west-1"
 

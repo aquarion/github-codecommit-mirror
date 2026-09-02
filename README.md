@@ -63,6 +63,10 @@ templates for standing up a second, independent deployment of this stack. If
 you already have a state bucket, skip the bootstrap step and write
 `backend.hcl` by hand from [`backend.hcl.example`](backend.hcl.example).
 
+Commit `backend.hcl` and `terraform.tfvars` (once, when you first set them up,
+or whenever you change them) and push to `main` - that's what triggers the
+`deploy` job in CI.
+
 To apply locally instead of waiting for CI (e.g. while iterating on a change
 before it reaches `main`):
 
