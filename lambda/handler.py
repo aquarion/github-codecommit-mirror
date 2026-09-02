@@ -259,6 +259,7 @@ def list_github_repositories(token: str) -> list[dict]:
             "clone_url": repo["clone_url"],
             "description": repo.get("description") or "",
             "size_kb": repo.get("size") or 0,
+            "default_branch": repo.get("default_branch") or "",
         }
         for repo in ordered
     ]
@@ -331,6 +332,26 @@ def ensure_codecommit_repository(name: str, description: str, source: str) -> No
     except ClientError as error:
         # A concurrent run may have won the race; that is fine.
         if error.response["Error"]["Code"] != "RepositoryNameExistsException":
+            raise
+
+
+def realign_default_branch(name: str, default_branch: str) -> None:
+    """Point CodeCommit's default branch at GitHub's current one.
+
+    A ``push --mirror`` refuses to delete whatever branch CodeCommit
+    considers "current" (e.g. a merged dependabot branch left over from a
+    prior run). Moving the default onto the branch GitHub still has avoids
+    that rejection. Skipped when that branch has not reached CodeCommit yet
+    (e.g. the very first push, or a just-renamed default branch).
+    """
+    if not default_branch:
+        return
+    try:
+        codecommit.update_default_branch(
+            repositoryName=name, defaultBranchName=default_branch
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] != "BranchDoesNotExistException":
             raise
 
 
@@ -423,6 +444,8 @@ def mirror_repository(repo: dict) -> str:
         if not git(["for-each-ref", "--format=%(refname)"], cwd=workdir).strip():
             LOG.info("%s has no branches or tags; created %s empty", source, target)
             return "empty"
+
+        realign_default_branch(target, repo.get("default_branch", ""))
 
         LOG.info("Pushing %s to CodeCommit repository %s", source, target)
         git(

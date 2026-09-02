@@ -364,6 +364,23 @@ class TestListingAcrossOwners:
 
         assert names == ["acme/service", "octocat/personal"]
 
+    def test_carries_the_default_branch_through(self, monkeypatch):
+        self.owners(monkeypatch)
+        monkeypatch.setattr(
+            handler,
+            "github_get",
+            self.fake_github({
+                "/user/repos": (
+                    [self.repo("octocat/personal", default_branch="trunk")], "",
+                ),
+                "/orgs/acme/repos": ([], ""),
+            }),
+        )
+
+        [repo] = handler.list_github_repositories("t")
+
+        assert repo["default_branch"] == "trunk"
+
     def test_uses_the_org_endpoint_for_organisations(self, monkeypatch):
         self.owners(monkeypatch)
         requested = []
@@ -860,6 +877,57 @@ class TestEnsureCodeCommitRepository:
         assert len(fake.created[0]["repositoryDescription"]) <= 1000
 
 
+class TestRealignDefaultBranch:
+    class FakeCodeCommit:
+        def __init__(self, missing_branch=False):
+            self.missing_branch = missing_branch
+            self.calls = []
+
+        def update_default_branch(self, **kwargs):
+            self.calls.append(kwargs)
+            if self.missing_branch:
+                raise handler.ClientError(
+                    {"Error": {"Code": "BranchDoesNotExistException", "Message": "no"}},
+                    "UpdateDefaultBranch",
+                )
+
+    def test_points_codecommit_at_githubs_current_default_branch(self, monkeypatch):
+        fake = self.FakeCodeCommit()
+        monkeypatch.setattr(handler, "codecommit", fake)
+
+        handler.realign_default_branch("gh-o-r", "main")
+
+        assert fake.calls == [{"repositoryName": "gh-o-r", "defaultBranchName": "main"}]
+
+    def test_does_nothing_when_github_reported_no_default_branch(self, monkeypatch):
+        fake = self.FakeCodeCommit()
+        monkeypatch.setattr(handler, "codecommit", fake)
+
+        handler.realign_default_branch("gh-o-r", "")
+
+        assert fake.calls == []
+
+    def test_a_branch_not_yet_mirrored_is_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(
+            handler, "codecommit", self.FakeCodeCommit(missing_branch=True)
+        )
+
+        handler.realign_default_branch("gh-o-r", "main")
+
+    def test_other_codecommit_errors_propagate(self, monkeypatch):
+        class Denying(self.FakeCodeCommit):
+            def update_default_branch(self, **kwargs):
+                raise handler.ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "UpdateDefaultBranch",
+                )
+
+        monkeypatch.setattr(handler, "codecommit", Denying())
+
+        with pytest.raises(handler.ClientError):
+            handler.realign_default_branch("gh-o-r", "main")
+
+
 class TestMirrorRepository:
     """Runs real git against real repositories on disk."""
 
@@ -978,6 +1046,32 @@ class TestMirrorRepository:
         self.intercept_push(monkeypatch)
 
         assert handler.mirror_repository(repo) == "mirrored"
+
+    def test_realigns_the_default_branch_before_pushing(self, monkeypatch, tmp_path):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path))
+        repo["default_branch"] = "main"
+        pushes = self.intercept_push(monkeypatch)
+        calls = []
+        monkeypatch.setattr(
+            handler, "realign_default_branch", lambda *a: calls.append(a)
+        )
+
+        assert handler.mirror_repository(repo) == "mirrored"
+
+        assert calls == [("gh-octocat-thing", "main")]
+        assert calls[0][0] and pushes, "realignment must happen before the push"
+
+    def test_an_empty_repository_is_never_realigned(self, monkeypatch, tmp_path):
+        repo = self.setup(monkeypatch, tmp_path, self.source_repo(tmp_path, empty=True))
+        repo["default_branch"] = "main"
+        self.intercept_push(monkeypatch)
+        calls = []
+        monkeypatch.setattr(
+            handler, "realign_default_branch", lambda *a: calls.append(a)
+        )
+
+        assert handler.mirror_repository(repo) == "empty"
+        assert calls == []
 
 
 class TestGitHubRetries:

@@ -49,6 +49,7 @@ data "aws_iam_policy_document" "lambda" {
       "codecommit:GitPush",
       "codecommit:TagResource",
       "codecommit:UpdateRepositoryDescription",
+      "codecommit:UpdateDefaultBranch",
     ]
     resources = [local.codecommit_repository_arn_pattern]
   }
