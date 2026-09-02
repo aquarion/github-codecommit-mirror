@@ -48,21 +48,18 @@ data "aws_iam_policy_document" "github_actions_assume_role" {
 
     # AWS requires a scoped sub or job_workflow_ref condition on any web
     # identity trust policy - it rejects a policy conditioned only on
-    # repository/ref below. job_workflow_ref is used here instead of sub
-    # because GitHub's immutable-subject-claims rollout appends owner/repo
-    # numeric IDs to sub (e.g. "repo:owner@123/repo@456:ref:...") once a repo
-    # or org has been renamed, which this account has - a plain sub match
-    # silently stops working the moment that rolls out. job_workflow_ref
-    # stays name-based regardless.
-    # https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/
+    # repository/ref below. See github_actions_subject's description for why
+    # this is an ID-based value rather than the plain repo name.
     condition {
       test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:job_workflow_ref"
-      values   = ["${var.github_repository}/.github/workflows/ci.yml@refs/heads/main"]
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = [var.github_actions_subject]
     }
 
-    # Belt-and-braces on top of job_workflow_ref above - also name-based and
-    # unaffected by immutable subject claims.
+    # Belt-and-braces on top of sub above - name-based and unaffected by
+    # immutable subject claims, so this stays correct even if the sub value
+    # above ever needs updating for a reason other than a rename (e.g. a
+    # provider-side format change).
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:repository"
@@ -110,6 +107,8 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "iam:TagRole",
       "iam:PutRolePolicy",
       "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
       "iam:DeleteRolePolicy",
     ]
     resources = [local.mirror_lambda_role_arn]
@@ -139,6 +138,7 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "lambda:DeleteFunction",
       "lambda:TagResource",
       "lambda:ListTags",
+      "lambda:ListVersionsByFunction",
       "lambda:PutFunctionEventInvokeConfig",
       "lambda:GetFunctionEventInvokeConfig",
       "lambda:DeleteFunctionEventInvokeConfig",
@@ -174,10 +174,12 @@ data "aws_iam_policy_document" "github_actions_deploy" {
     actions = [
       "ecr:CreateRepository",
       "ecr:DescribeRepositories",
+      "ecr:DescribeImages",
       "ecr:DeleteRepository",
       "ecr:PutLifecyclePolicy",
       "ecr:GetLifecyclePolicy",
       "ecr:TagResource",
+      "ecr:ListTagsForResource",
       "ecr:PutImageScanningConfiguration",
     ]
     resources = [local.mirror_ecr_arn]
@@ -215,6 +217,7 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "events:RemoveTargets",
       "events:ListTargetsByRule",
       "events:TagResource",
+      "events:ListTagsForResource",
     ]
     resources = [local.mirror_events_rule_arn]
   }
@@ -228,8 +231,11 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "sns:DeleteTopic",
       "sns:Subscribe",
       "sns:Unsubscribe",
+      "sns:GetSubscriptionAttributes",
+      "sns:SetSubscriptionAttributes",
       "sns:ListSubscriptionsByTopic",
       "sns:TagResource",
+      "sns:ListTagsForResource",
     ]
     resources = [local.mirror_sns_topic_arn]
   }
@@ -241,6 +247,7 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "cloudwatch:DescribeAlarms",
       "cloudwatch:DeleteAlarms",
       "cloudwatch:TagResource",
+      "cloudwatch:ListTagsForResource",
     ]
     resources = [local.mirror_alarm_arn]
   }
@@ -252,6 +259,7 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "secretsmanager:DescribeSecret",
       "secretsmanager:DeleteSecret",
       "secretsmanager:TagResource",
+      "secretsmanager:GetResourcePolicy",
     ]
     resources = [local.mirror_secret_arn]
   }
