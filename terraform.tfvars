@@ -1,0 +1,31 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+
+aws_region = "eu-west-1"
+
+# Whose repositories to mirror. A personal account and any number of
+# organisations can share one deployment, as long as one token reaches them all.
+github_owners = [
+  { name = "aquarion", type = "user" },
+  { name = "istic", type = "org" },
+]
+
+# What to mirror. The defaults skip forks and archived repositories.
+visibility       = "all"
+include_forks    = true
+include_archived = false
+# exclude_pattern = "^aquarion/(scratch|sandbox)-"
+
+# CodeCommit repositories are named <prefix><owner>-<repo>.
+codecommit_name_prefix = "gh-"
+
+# Daily at 03:00 UTC.
+schedule_expression = "cron(0 4 * * ? *)"
+
+# Get told when a run fails. alert_email_from must be a verified SES identity;
+# the SNS subscription AWS creates for the alarms needs confirming by email once.
+alert_email_to   = ["nicholas+codecommitmirror@aquarionics.com"]
+alert_email_from = "codecommitmirror@aquarionics.com"
+# ses_region = "eu-west-1"
+
+# Or route the alarms into a topic you already manage:
+# alarm_sns_topic_arn = "arn:aws:sns:eu-west-1:123456789012:alerts"
