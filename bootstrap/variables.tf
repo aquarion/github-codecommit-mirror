@@ -41,6 +41,27 @@ variable "github_repository" {
   }
 }
 
+variable "github_actions_subject" {
+  description = <<-EOT
+    The exact OIDC 'sub' claim GitHub Actions presents for a push to main on
+    this repository, used as the trust policy's scoped sub condition (AWS
+    requires either a scoped sub or job_workflow_ref condition on a web
+    identity trust policy - it rejects one scoped only on the separate
+    repository/ref claims).
+
+    This repository has GitHub's immutable-subject-claims feature enabled
+    (automatic once an org/repo has been renamed - this one has, from
+    "istic" to "aquarion"), so the claim carries permanent numeric IDs
+    rather than plain names:
+    "repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:refs/heads/<branch>".
+    Captured from a CloudTrail AssumeRoleWithWebIdentity event's
+    userIdentity.principalId after a deploy attempt. Being ID-based, it does
+    not need updating if the repository or owner is renamed again.
+  EOT
+  type        = string
+  default     = "repo:aquarion@201155/github-codecommit-mirror@1349881595:ref:refs/heads/main"
+}
+
 variable "mirror_stack_name" {
   description = <<-EOT
     Must match `name` in the parent module (default
