@@ -46,12 +46,36 @@ data "aws_iam_policy_document" "github_actions_assume_role" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Only a workflow run triggered by a push already on main can assume
-    # this role - a pull_request-triggered run carries a different sub claim.
+    # AWS requires a scoped sub or job_workflow_ref condition on any web
+    # identity trust policy - it rejects a policy conditioned only on
+    # repository/ref below. job_workflow_ref is used here instead of sub
+    # because GitHub's immutable-subject-claims rollout appends owner/repo
+    # numeric IDs to sub (e.g. "repo:owner@123/repo@456:ref:...") once a repo
+    # or org has been renamed, which this account has - a plain sub match
+    # silently stops working the moment that rolls out. job_workflow_ref
+    # stays name-based regardless.
+    # https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/
     condition {
       test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repository}:ref:refs/heads/main"]
+      variable = "token.actions.githubusercontent.com:job_workflow_ref"
+      values   = ["${var.github_repository}/.github/workflows/ci.yml@refs/heads/main"]
+    }
+
+    # Belt-and-braces on top of job_workflow_ref above - also name-based and
+    # unaffected by immutable subject claims.
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository"
+      values   = [var.github_repository]
+    }
+
+    # Only a workflow run triggered by a push already on main can assume
+    # this role - a pull_request-triggered run carries a different ref value
+    # (e.g. refs/pull/N/merge).
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:ref"
+      values   = ["refs/heads/main"]
     }
   }
 }
